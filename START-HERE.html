@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Requirements Board setup</title>
+<style>
+  :root {
+    --paper: #edf2f0; --card: #ffffff; --card-soft: #f7faf9; --ink: #1f2b30; --ink-2: #44535a; --ink-3: #5f6e74; --ink-4: #98a5aa;
+    --rule: #d7e0dd; --teal: #0d6e63; --teal-tint: #e3f1ee; --amber-tint: #fdf4e3; --amber: #c0851b;
+    --mono: ui-monospace, 'JetBrains Mono', SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--paper); color: var(--ink); font: 15px/1.55 'Hanken Grotesk', system-ui, -apple-system, 'Segoe UI', sans-serif; }
+  main { max-width: 920px; margin: 0 auto; padding: 40px 20px 80px; }
+  .kicker { margin: 0; font-size: 13px; font-weight: 600; color: var(--teal); }
+  h1 { margin: 4px 0 8px; font-size: 32px; line-height: 1.15; }
+  .lede { margin: 0 0 8px; font-size: 17px; color: var(--ink-2); }
+  .version { font-family: var(--mono); font-size: 12px; color: var(--ink-4); }
+  h2 { margin: 44px 0 6px; font-size: 21px; }
+  h2 .n { display: inline-grid; place-items: center; width: 28px; height: 28px; margin-right: 10px; border-radius: 50%; background: var(--teal); color: #fff; font-size: 15px; vertical-align: 2px; }
+  h3 { margin: 0 0 6px; font-size: 15px; }
+  p { margin: 8px 0; }
+  .sub { color: var(--ink-2); }
+  code { font-family: var(--mono); font-size: 0.88em; }
+  .card { margin: 14px 0; padding: 16px 18px; border: 1px solid var(--rule); border-radius: 10px; background: var(--card); }
+  .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+  .grid .card { margin: 0; }
+  .grid p { margin: 0; font-size: 13.5px; color: var(--ink-2); }
+  .tree { margin: 0; padding: 14px 18px; border-radius: 8px; background: var(--card-soft); border: 1px solid var(--rule); font-family: var(--mono); font-size: 13px; line-height: 1.7; white-space: pre; overflow-x: auto; }
+  .tree b { color: var(--teal); }
+  .block { position: relative; margin: 10px 0; }
+  .block pre { margin: 0; padding: 14px 16px; padding-right: 96px; border-radius: 8px; background: #1f2b30; color: #e8efed; font-family: var(--mono); font-size: 13px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
+  .block.prompt pre { background: var(--teal-tint); color: var(--ink); border-left: 3px solid var(--teal); font-family: inherit; font-size: 14px; }
+  .copy { position: absolute; top: 8px; right: 8px; padding: 5px 10px; border: 1px solid rgba(255,255,255,0.25); border-radius: 6px; background: rgba(255,255,255,0.1); color: #fff; font: 600 12px/1 system-ui, sans-serif; cursor: pointer; }
+  .prompt .copy { border-color: var(--teal); background: var(--teal); }
+  .copy:hover { filter: brightness(1.1); }
+  .choice { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .badge { display: inline-block; margin-left: 6px; padding: 1px 8px; border-radius: 999px; background: var(--teal-tint); color: var(--teal); font-size: 11.5px; font-weight: 700; vertical-align: 2px; }
+  .facts { margin: 8px 0 0; padding-left: 20px; color: var(--ink-2); font-size: 14px; }
+  .facts li { margin: 3px 0; }
+  .note { padding: 10px 14px; border-radius: 8px; background: var(--amber-tint); border-left: 3px solid var(--amber); font-size: 14px; }
+  details { margin: 12px 0; padding: 10px 16px; border: 1px solid var(--rule); border-radius: 10px; background: var(--card); }
+  summary { cursor: pointer; font-weight: 600; }
+  ol.steps { margin: 8px 0; padding-left: 22px; }
+  ol.steps li { margin: 10px 0; }
+  .loop svg { display: block; width: 100%; height: auto; border-radius: 10px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  td { padding: 8px 10px; border-top: 1px solid var(--rule); vertical-align: top; }
+  td:first-child { white-space: nowrap; font-family: var(--mono); font-size: 13px; color: var(--teal); }
+  footer { margin-top: 56px; font-size: 12.5px; color: var(--ink-4); }
+  @media (max-width: 720px) { .grid, .choice { grid-template-columns: 1fr; } h1 { font-size: 26px; } }
+</style>
+</head>
+<body>
+<main>
+  <p class="kicker">Start here</p>
+  <h1>Set up the Requirements Board</h1>
+  <p class="lede">A requirements catalogue kept as Markdown files in git, a local board to read and arrange it, and Claude Code skills that keep it up to date from your meetings and decisions.</p>
+  <p class="version">Kit 1.12.0</p>
+
+  <div class="grid" style="margin-top:24px">
+    <div class="card"><h3>Files in git</h3><p>Every epic, feature, story and question is a Markdown file. A commit is a version of the requirements.</p></div>
+    <div class="card"><h3>A local board</h3><p>Runs on your machine and edits the same files: arrange cards, set statuses, answer questions, open diagrams.</p></div>
+    <div class="card"><h3>Claude's skills</h3><p>Turn transcripts, notes and decisions into changes to those files, and keep a build plan in step.</p></div>
+  </div>
+
+  <h2><span class="n">1</span>Check what you need</h2>
+  <ul class="facts">
+    <li><b>Node 22.18 or newer.</b> Check with <code>node -v</code>; get it from nodejs.org or nvm.</li>
+    <li><b>Claude Code</b>, for the skills.</li>
+    <li><b>git</b> (recommended): the build plan skill works from commits, and git keeps the requirements' history.</li>
+  </ul>
+
+  <h2><span class="n">2</span>Put this folder in a repo</h2>
+  <p class="sub">The <code>requirements-board</code> folder goes at the root of a repo: beside your app or prototype, or on its own in a new repo. It never touches your app.</p>
+  <div class="tree">your-repo/
+├── <b>requirements-board/</b>     ← this folder
+├── your-app/                (if you have one)
+├── .claude/skills/          (the board's skills are copied in here, next to any you have)
+└── CLAUDE.md</div>
+  <p class="sub">Starting fresh? Make a new folder, put <code>requirements-board</code> in it, and run <code>git init</code> there.</p>
+
+  <h2><span class="n">3</span>Set it up</h2>
+  <div class="choice">
+    <div class="card">
+      <h3>With Claude Code <span class="badge">easiest</span></h3>
+      <p class="sub">Open Claude Code at the repo root and paste the prompt below. It installs everything, copies the skills in, adds a section to your CLAUDE.md, asks you a few questions about your project, and starts the board.</p>
+    </div>
+    <div class="card">
+      <h3>By hand</h3>
+      <p class="sub">Run the commands yourself: open "Set it up by hand" below the prompt.</p>
+    </div>
+  </div>
+
+  <div class="block prompt"><pre id="prompt">Set up the Requirements Board in this repo. Its folder, requirements-board/, is at the repo root.
+
+1. Check that Node is 22.18 or newer (node -v). If it isn't, tell me how to upgrade and stop.
+2. Run `npm --prefix requirements-board install`, then `npm --prefix requirements-board run install-skills`.
+3. Add the "Requirements" section from requirements-board/START-HERE.html to the CLAUDE.md at the repo root. Create the file if there is none, and don't add the section twice.
+4. Fill in every &lt;TODO: ...&gt; placeholder in the "This repo" section of each skill in requirements-board/agent/skills/ (requirements-board/ADOPTING.md, step 4, says what each one needs). Look in this repo first, then ask me for whatever you can't find, all in one go. Afterwards run `npm --prefix requirements-board run install-skills` again.
+5. Run `npm --prefix requirements-board run check`, then start the board with `npm --prefix requirements-board run dev` in the background and give me its URL.</pre><button class="copy" data-copy="prompt">Copy</button></div>
+
+  <p class="sub">Claude Code will ask you for:</p>
+  <ul class="facts">
+    <li>who signs the requirements off (your client, product owner, sponsor);</li>
+    <li>where your app lives, and where the build plan should go;</li>
+    <li>the people involved and which documents count for most when sources disagree;</li>
+    <li>a folder outside the repo for consistency review runs.</li>
+  </ul>
+
+  <details>
+    <summary>Set it up by hand</summary>
+    <ol class="steps">
+      <li>From the repo root, install the board and copy its skills into <code>.claude/</code>:
+        <div class="block"><pre id="cmd-install">npm --prefix requirements-board install
+npm --prefix requirements-board run install-skills</pre><button class="copy" data-copy="cmd-install">Copy</button></div>
+      </li>
+      <li>Add this section to <code>CLAUDE.md</code> at the repo root (make the file if there is none):
+        <div class="block"><pre id="claude-md">## Requirements
+
+The requirements live in `requirements-board/requirements/` (format: its `SCHEMA.md`). Edit them as files or on
+the Requirements Board (`npm --prefix requirements-board run dev`, http://localhost:5180), then run
+`npm --prefix requirements-board run check`, which must pass. Record meetings and decisions with
+`/update-requirements`; after a commit, `/update-build-plan` keeps the build plan in step. The skills'
+source is `requirements-board/agent/`: edit them there, then run `npm --prefix requirements-board run install-skills`.</pre><button class="copy" data-copy="claude-md">Copy</button></div>
+      </li>
+      <li>In each <code>requirements-board/agent/skills/*/SKILL.md</code>, fill in the <code>&lt;TODO: ...&gt;</code> placeholders in its "This repo" section (<code>ADOPTING.md</code>, step 4, says what each needs). Then run <code>install-skills</code> again.</li>
+      <li>Start the board:
+        <div class="block"><pre id="cmd-dev">npm --prefix requirements-board run dev</pre><button class="copy" data-copy="cmd-dev">Copy</button></div>
+      </li>
+    </ol>
+  </details>
+
+  <h2><span class="n">4</span>Open the board</h2>
+  <p class="sub">Go to <b>http://localhost:5180</b>. It starts with a few cards, a question and a diagram that explain how it works.</p>
+  <ul class="facts">
+    <li><b>Start here</b> (top right) opens the About page: the requirements loop, every skill, and what is on the board.</li>
+    <li><b>Settings</b> (the cog): name the board and the project, set your components and statuses, and edit the <b>writing voice</b>: how Claude Code writes your requirements (kept in <code>requirements/VOICE.md</code>), to match how your team writes.</li>
+    <li>Start a <b>new Claude Code session</b> so it picks up the skills: type <code>/</code> to see them.</li>
+    <li>When you're ready, delete the starter cards (the "Delete these examples" card says how).</li>
+  </ul>
+
+  <h2><span class="n">5</span>Go round the loop</h2>
+  <p class="sub">After each meeting or decision, hand Claude Code the evidence with <code>/update-requirements</code>, review the result on the board, commit, then keep the build plan in step with <code>/update-build-plan</code>.</p>
+  <div class="loop"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1060 818" width="1060" height="818" font-family="'Schibsted Grotesk', 'Helvetica Neue', Helvetica, Arial, sans-serif"><title>The requirements loop</title>
+<rect x="0" y="0" width="1060" height="818" rx="0" fill="#F3F6FA"/>
+<path d="M196.0 205.0 H864.0 Q890.0 205.0 890.0 231.0 V539.0 Q890.0 565.0 864.0 565.0 H196.0 Q170.0 565.0 170.0 539.0 V231.0 Q170.0 205.0 196.0 205.0" stroke="#3B8FD6" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+<g id="side-tools">
+<g id="tool-transcript-reconciler">
+<rect x="30" y="20" width="280" height="78" rx="9" fill="#FFFFFF" stroke="#9C9CA8" stroke-width="1.2" stroke-dasharray="5 4"/>
+<text x="44" y="42" font-size="11.5" font-weight="700" fill="#8A8A96" text-anchor="start">Side input</text>
+<text x="44" y="63" font-size="15" font-weight="700" fill="#1B1B1F" text-anchor="start">transcript-reconciler</text>
+<text x="44" y="83" font-size="12.5" font-weight="400" fill="#55555E" text-anchor="start">merges duplicate transcripts of a meeting</text>
+<path d="M170.0 100 V121" stroke="#55555E" stroke-width="1.8"/><path d="M164.0 120 L176.0 120 L170.0 128 z" fill="#55555E"/>
+</g>
+<g id="tool-artifacts">
+<rect x="750" y="20" width="280" height="78" rx="9" fill="#FFFFFF" stroke="#9C9CA8" stroke-width="1.2" stroke-dasharray="5 4"/>
+<text x="764" y="42" font-size="11.5" font-weight="700" fill="#8A8A96" text-anchor="start">Side input</text>
+<text x="764" y="63" font-size="15" font-weight="700" fill="#1B1B1F" text-anchor="start">add-artifact · svg-diagram</text>
+<text x="764" y="83" font-size="12.5" font-weight="400" fill="#55555E" text-anchor="start">add diagrams and documents to link to</text>
+<path d="M890.0 100 V121" stroke="#55555E" stroke-width="1.8"/><path d="M884.0 120 L896.0 120 L890.0 128 z" fill="#55555E"/>
+</g>
+</g>
+<g id="step-1">
+<rect x="20" y="130" width="300" height="150" rx="14" fill="#FFFFFF" stroke="#D3DCE6" stroke-width="1.2"/>
+<circle cx="54" cy="166" r="16" fill="#3B8FD6"/>
+<text x="54" y="172.72" font-size="17.6" font-weight="800" fill="#FFFFFF" text-anchor="middle">1</text>
+<text x="80" y="174" font-size="21" font-weight="800" fill="#1B1B1F" text-anchor="start">Evidence</text>
+<text x="38" y="206" font-size="13" font-weight="400" fill="#55555E" text-anchor="start">A meeting, a transcript, an email or a</text>
+<text x="38" y="224" font-size="13" font-weight="400" fill="#55555E" text-anchor="start">decision someone has made: anything</text>
+<text x="38" y="242" font-size="13" font-weight="400" fill="#55555E" text-anchor="start">that changes what the system should do.</text>
+</g>
+<g id="step-2">
+<circle cx="350.0" cy="205.0" r="15" fill="#3B8FD6"/>
+<path d="M346.0 198.0 L354.0 205.0 L346.0 212.0" stroke="#FFFFFF" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+<rect x="380" y="130" width="300" height="150" rx="14" fill="#FFFFFF" stroke="#D3DCE6" stroke-width="1.2"/>
+<circle cx="414" cy="166" r="16" fill="#3B8FD6"/>
+<text x="414" y="172.72" font-size="17.6" font-weight="800" fill="#FFFFFF" text-anchor="middle">2</text>
+<text x="440" y="174" font-size="21" font-weight="800" fill="#1B1B1F" text-anchor="start">/update-requirements</text>
+<text x="398" y="206" font-size="13" font-weight="400" fill="#55555E" text-anchor="start">Files the evidence as a note, answers the</text>
+<text x="398" y="224" font-size="13" font-weight="400" fill="#55555E" text-anchor="start">questions it settles, updates epics,</text>
+<text x="398" y="242" font-size="13" font-weight="400" fill="#55555E" text-anchor="start">features and stories, writes a change log.</text>
+</g>
+<g id="step-3">
+<circle cx="710.0" cy="205.0" r="15" fill="#3B8FD6"/>
+<path d="M706.0 198.0 L714.0 205.0 L706.0 212.0" stroke="#FFFFFF" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+<rect x="740" y="130" width="300" height="150" rx="14" fill="#FFFFFF" stroke="#D3DCE6" stroke-width="1.2"/>
+<circle cx="774" cy="166" r="16" fill="#3B8FD6"/>
+<text x="774" y="172.72" font-size="17.6" font-weight="800" fill="#FFFFFF" text-anchor="middle">3</text>
+<text x="800" y="174" font-size="21" font-weight="800" fill="#1B1B1F" text-anchor="start">Review on the board</text>
+<text x="758" y="206" font-size="13" font-weight="400" fill="#55555E" text-anchor="start">Check statuses, answer outstanding</text>
+<text x="758" y="224" font-size="13" font-weight="400" fill="#55555E" text-anchor="start">questions and arrange the swimlanes.</text>
+<text x="758" y="242" font-size="13" font-weight="400" fill="#55555E" text-anchor="start">New answers go in the next update.</text>
+</g>
+<g id="step-4">
+<circle cx="890.0" cy="385.0" r="15" fill="#3B8FD6"/>
+<path d="M883.0 381.0 L890.0 389.0 L897.0 381.0" stroke="#FFFFFF" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+<rect x="740" y="490" width="300" height="150" rx="14" fill="#FFFFFF" stroke="#D3DCE6" stroke-width="1.2"/>
+<circle cx="774" cy="526" r="16" fill="#3B8FD6"/>
+<text x="774" y="532.72" font-size="17.6" font-weight="800" fill="#FFFFFF" text-anchor="middle">4</text>
+<text x="800" y="534" font-size="21" font-weight="800" fill="#1B1B1F" text-anchor="start">Commit</text>
+<text x="758" y="566" font-size="13" font-weight="400" fill="#55555E" text-anchor="start">The team commits the catalogue to git.</text>
+<text x="758" y="584" font-size="13" font-weight="400" fill="#55555E" text-anchor="start">The commit is the baseline the build</text>
+<text x="758" y="602" font-size="13" font-weight="400" fill="#55555E" text-anchor="start">plan is updated from.</text>
+</g>
+<g id="step-5">
+<circle cx="710.0" cy="565.0" r="15" fill="#3B8FD6"/>
+<path d="M714.0 558.0 L706.0 565.0 L714.0 572.0" stroke="#FFFFFF" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+<rect x="380" y="490" width="300" height="150" rx="14" fill="#FFFFFF" stroke="#D3DCE6" stroke-width="1.2"/>
+<circle cx="414" cy="526" r="16" fill="#3B8FD6"/>
+<text x="414" y="532.72" font-size="17.6" font-weight="800" fill="#FFFFFF" text-anchor="middle">5</text>
+<text x="440" y="534" font-size="21" font-weight="800" fill="#1B1B1F" text-anchor="start">/update-build-plan</text>
+<text x="398" y="566" font-size="13" font-weight="400" fill="#55555E" text-anchor="start">Pass it the commit. It re-grades the</text>
+<text x="398" y="584" font-size="13" font-weight="400" fill="#55555E" text-anchor="start">changed requirements against the app</text>
+<text x="398" y="602" font-size="13" font-weight="400" fill="#55555E" text-anchor="start">and updates the build plan.</text>
+</g>
+<g id="step-6">
+<circle cx="350.0" cy="565.0" r="15" fill="#3B8FD6"/>
+<path d="M354.0 558.0 L346.0 565.0 L354.0 572.0" stroke="#FFFFFF" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+<rect x="20" y="490" width="300" height="150" rx="14" fill="#FFFFFF" stroke="#D3DCE6" stroke-width="1.2"/>
+<circle cx="54" cy="526" r="16" fill="#3B8FD6"/>
+<text x="54" y="532.72" font-size="17.6" font-weight="800" fill="#FFFFFF" text-anchor="middle">6</text>
+<text x="80" y="534" font-size="21" font-weight="800" fill="#1B1B1F" text-anchor="start">Build</text>
+<text x="38" y="566" font-size="13" font-weight="400" fill="#55555E" text-anchor="start">The team builds the next phases of the</text>
+<text x="38" y="584" font-size="13" font-weight="400" fill="#55555E" text-anchor="start">plan. What they learn comes to the</text>
+<text x="38" y="602" font-size="13" font-weight="400" fill="#55555E" text-anchor="start">next meeting as new evidence.</text>
+</g>
+<g id="loop-back">
+<circle cx="170.0" cy="385.0" r="15" fill="#3B8FD6"/>
+<path d="M163.0 389.0 L170.0 381.0 L177.0 389.0" stroke="#FFFFFF" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="144.0" y="381.0" font-size="13.5" font-weight="400" fill="#55555E" text-anchor="end" font-style="italic">Next meeting,</text>
+<text x="144.0" y="399.0" font-size="13.5" font-weight="400" fill="#55555E" text-anchor="end" font-style="italic">round again</text>
+</g>
+<g id="catalogue">
+<rect x="204.0" y="310" width="652.0" height="150" rx="14" fill="#2E2E31" stroke="#55555C" stroke-width="1.2"/>
+<text x="228.0" y="354" font-size="27" font-weight="800" fill="#FFFFFF" text-anchor="start">The catalogue</text>
+<text x="228.0" y="380" font-size="14" font-weight="400" fill="#D7D7DE" text-anchor="start">Markdown files in git, one per epic, feature, story and question, plus notes,</text>
+<text x="228.0" y="398" font-size="14" font-weight="400" fill="#D7D7DE" text-anchor="start">change logs and artifacts. The board and every skill read and edit the same files.</text>
+<rect x="228.0" y="422" width="55.0" height="24" rx="12.0" fill="#3D3D42" stroke="#55555C" stroke-width="1.2"/>
+<text x="255.5" y="438.32" font-size="12" font-weight="600" fill="#D7D7DE" text-anchor="middle">Epics</text>
+<rect x="291.0" y="422" width="74.8" height="24" rx="12.0" fill="#3D3D42" stroke="#55555C" stroke-width="1.2"/>
+<text x="328.4" y="438.32" font-size="12" font-weight="600" fill="#D7D7DE" text-anchor="middle">Features</text>
+<rect x="373.79999999999995" y="422" width="68.19999999999999" height="24" rx="12.0" fill="#3D3D42" stroke="#55555C" stroke-width="1.2"/>
+<text x="407.9" y="438.32" font-size="12" font-weight="600" fill="#D7D7DE" text-anchor="middle">Stories</text>
+<rect x="450.0" y="422" width="81.4" height="24" rx="12.0" fill="#3D3D42" stroke="#55555C" stroke-width="1.2"/>
+<text x="490.7" y="438.32" font-size="12" font-weight="600" fill="#D7D7DE" text-anchor="middle">Questions</text>
+<rect x="539.4" y="422" width="55.0" height="24" rx="12.0" fill="#3D3D42" stroke="#55555C" stroke-width="1.2"/>
+<text x="566.9" y="438.32" font-size="12" font-weight="600" fill="#D7D7DE" text-anchor="middle">Notes</text>
+<rect x="602.4" y="422" width="94.6" height="24" rx="12.0" fill="#3D3D42" stroke="#55555C" stroke-width="1.2"/>
+<text x="649.6999999999999" y="438.32" font-size="12" font-weight="600" fill="#D7D7DE" text-anchor="middle">Change logs</text>
+<rect x="705.0" y="422" width="81.4" height="24" rx="12.0" fill="#3D3D42" stroke="#55555C" stroke-width="1.2"/>
+<text x="745.7" y="438.32" font-size="12" font-weight="600" fill="#D7D7DE" text-anchor="middle">Artifacts</text>
+</g>
+<rect id="now-and-then" x="20" y="662" width="1020" height="76" rx="0" fill="none"/>
+<path d="M30 662 H20 V738 H30" stroke="#55555E" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="36" y="684" font-size="13.5" font-weight="700" fill="#55555E" text-anchor="start" font-style="italic">Now and then</text>
+<text x="36" y="702" font-size="13.5" font-weight="400" fill="#55555E" text-anchor="start" font-style="italic">link-requirements: links each item to the items its text names, after items are added or reworded.</text>
+<text x="36" y="720" font-size="13.5" font-weight="400" fill="#55555E" text-anchor="start" font-style="italic">consistency-review: catches drift across the whole catalogue (stale wording, contradicted decisions).</text>
+<rect x="20" y="758" width="1020" height="40" rx="10" fill="#FFF5C4" stroke="#EFD46A" stroke-width="1.2"/>
+<text x="530.0" y="785" font-size="19" fill="#1B1B1F" text-anchor="middle"><tspan font-weight="800">Each round:</tspan> evidence → update requirements → review → commit → update the plan → build</text>
+</svg>
+</div>
+
+  <table style="margin-top:18px">
+    <tr><td>/update-requirements</td><td>Turn a meeting, transcript, email or decision into requirement changes, with a note and a change log.</td></tr>
+    <tr><td>/update-build-plan</td><td>Bring the build plan up to date after requirements changes are committed; makes the first plan too.</td></tr>
+    <tr><td>/add-artifact</td><td>Register a diagram, mockup, transcript or document that requirements link to.</td></tr>
+    <tr><td>/svg-diagram</td><td>Draw an explainer diagram in the board's house style, saved as an artifact.</td></tr>
+    <tr><td>/transcript-reconciler</td><td>Merge two or more transcripts of the same meeting into one.</td></tr>
+    <tr><td>/consistency-review</td><td>Find and fix drift across the whole catalogue, with a review page before any edit.</td></tr>
+    <tr><td>link-requirements</td><td>A workflow that links items to the items their text names.</td></tr>
+  </table>
+
+  <h2>If something goes wrong</h2>
+  <details><summary>The skills don't show when I type <code>/</code></summary>
+    <p>Start a new Claude Code session at the repo root. Still missing? Run <code>npm --prefix requirements-board run install-skills</code> from the repo root: it copies them into <code>.claude/skills/</code>, and says if it skipped any because your repo already has a skill of the same name.</p></details>
+  <details><summary>I edited a skill and nothing changed</summary>
+    <p>The skills' source is <code>requirements-board/agent/skills/</code>; <code>.claude/skills/</code> holds copies. Edit the source, then run <code>install-skills</code> again. Edits made in <code>.claude/</code> are overwritten.</p></details>
+  <details><summary>"Port 5180 is in use"</summary>
+    <p>The board is probably already running in another terminal: open http://localhost:5180. Otherwise stop whatever holds the port.</p></details>
+  <details><summary>Errors about Node or TypeScript files</summary>
+    <p>The board's scripts need Node 22.18 or newer (<code>node -v</code>). Upgrade, then run the install again.</p></details>
+  <details><summary>Checks show an error</summary>
+    <p>Click <b>Checks</b> in the board's masthead to see which file and why, or run <code>npm --prefix requirements-board run check</code>. Ask Claude Code to fix it if it isn't obvious.</p></details>
+
+  <footer>This page is <code>requirements-board/START-HERE.html</code>. More detail: <code>README.md</code> (the board) and <code>ADOPTING.md</code> (moving it into a repo by hand).</footer>
+</main>
+<script>
+  for (const b of document.querySelectorAll('[data-copy]')) {
+    b.addEventListener('click', async () => {
+      const text = document.getElementById(b.dataset.copy).innerText
+      try {
+        await navigator.clipboard.writeText(text)
+      } catch {
+        const t = document.createElement('textarea')
+        t.value = text
+        document.body.append(t)
+        t.select()
+        document.execCommand('copy')
+        t.remove()
+      }
+      b.textContent = 'Copied'
+      setTimeout(() => (b.textContent = 'Copy'), 1500)
+    })
+  }
+</script>
+</body>
+</html>

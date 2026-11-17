@@ -1,0 +1,349 @@
+/**
+ * The catalogue's record shapes. Shared by the dev-server file API, the
+ * scripts (migrate / check / export:csv) and the browser app, so all three
+ * read and write the same thing.
+ */
+
+import type { BoardConfig } from './config.ts'
+
+export const ITEM_TYPES = ['epic', 'feature', 'story'] as const
+export type ItemType = (typeof ITEM_TYPES)[number]
+
+export const TYPE_LABEL: Record<ItemType, string> = { epic: 'Epic', feature: 'Feature', story: 'Story' }
+
+/** What an item of this type may sit under: a feature under an epic, a story under a feature or straight under an epic. */
+export const PARENT_TYPES: Record<ItemType, readonly ItemType[]> = { epic: [], feature: ['epic'], story: ['feature', 'epic'] }
+
+/** A status code from the project's config (`statuses.ts`): what it means and how it shows live there. */
+export type ItemStatus = string
+export type QuestionStatus = string
+
+/** What an outstanding item asks for: a decision (`question`) or where a requirement came from (`missing-source`). */
+export const QUESTION_KINDS = ['question', 'missing-source'] as const
+export type QuestionKind = (typeof QUESTION_KINDS)[number]
+
+export const VIEWPORTS = ['desktop', 'mobile'] as const
+export type Viewport = (typeof VIEWPORTS)[number]
+
+export interface ImageRef {
+  /** Path relative to the requirements folder, e.g. `assets/US-01.1.1/dashboard.png`. */
+  src: string
+  viewport: Viewport
+  /** Which app it shows: a `screenshotApps` key from `board.config.json`. The gallery groups by it. */
+  app?: string
+  caption?: string
+}
+
+export interface Item {
+  id: string
+  type: ItemType
+  /** Null only for epics. */
+  parent: string | null
+  title: string
+  status: ItemStatus
+  components: string[]
+  sources: string[]
+  /** Sort position among siblings (1-based). The Mapped board rewrites it when a card is dragged. */
+  order: number
+  /** Stories only: the Mapped board's swim lane, by name (one of `Layout.lanes`), or null for the unnamed first lane. */
+  swimlane: string | null
+  /** Items this one is related to, by ID (epics, features, stories). Stored on one side, shown on both. */
+  related: string[]
+  /** Artifacts this item points at: `AR-01`, or `AR-01#region` for a spot inside one. Shown on both sides. */
+  artifacts: string[]
+  images: ImageRef[]
+  description: string
+  /** `## Acceptance criteria` section: Markdown, typically one criterion per list item. */
+  acceptance: string
+  /** `## Technical discussion` section: Markdown. */
+  technical: string
+  notes: string
+  /** Frontmatter keys this tool doesn't know about, kept verbatim so agents can add fields. */
+  extra: Record<string, unknown>
+}
+
+export interface Question {
+  id: string
+  kind: QuestionKind
+  title: string
+  affects: string[]
+  owner: string
+  status: QuestionStatus
+  sources: string[]
+  question: string
+  answer: string
+  extra: Record<string, unknown>
+}
+
+export interface Layout {
+  /** Card positions that override the auto story-map layout (Freeform mode only). */
+  positions: Record<string, { x: number; y: number }>
+  /** The Mapped board's named swim lanes, top to bottom, below the implicit first lane. */
+  lanes: string[]
+  /** What the implicit first lane (stories with no `swimlane`) is called. Unset: `UNASSIGNED_LANE`. */
+  firstLane?: string
+}
+
+/** The implicit first lane's name until it is renamed. */
+export const UNASSIGNED_LANE = 'Unassigned'
+export const firstLaneName = (layout: Pick<Layout, 'firstLane'>) => layout.firstLane || UNASSIGNED_LANE
+
+/** A record plus the hash of the file text it was read from (for optimistic concurrency). */
+export interface Rev<T> {
+  data: T
+  rev: string
+}
+
+export interface Issue {
+  severity: 'error' | 'warning'
+  /** The record (or file) the issue is about. */
+  id: string
+  message: string
+}
+
+export interface CatalogueSnapshot {
+  items: Record<string, Rev<Item>>
+  questions: Record<string, Rev<Question>>
+  artifacts: Record<string, ArtifactRec>
+  layout: Layout
+  /** The project's vocabulary (`board.config.json`); the defaults when there is none. */
+  config: BoardConfig
+  issues: Issue[]
+}
+
+/** Pushed over Vite's HMR socket when a catalogue file changes on disk. */
+export type CatalogueEvent =
+  | { kind: 'item'; id: string; record: Rev<Item> | null }
+  | { kind: 'question'; id: string; record: Rev<Question> | null }
+  | { kind: 'artifact'; id: string; record: ArtifactRec | null }
+  | { kind: 'layout'; layout: Layout }
+  | { kind: 'config'; config: BoardConfig }
+  | { kind: 'issues'; issues: Issue[] }
+
+/* -------------------------------------------------------------- artifacts */
+
+/** What an artifact is, for its icon and for filtering. Not its file format (that follows from the file). */
+export const ARTIFACT_KINDS = ['diagram', 'mockup', 'screenshot', 'photo', 'transcript', 'note', 'document'] as const
+export type ArtifactKind = (typeof ARTIFACT_KINDS)[number]
+
+/**
+ * Current is the baseline and goes unmarked. Retired keeps the record (and its ID) of one that is no
+ * longer the version to go by, hidden on the Artifacts tab unless retired artifacts are shown; when a
+ * newer artifact replaced it, `supersededBy` says which. There is deliberately one past status, not a
+ * second "Superseded" one: whether something replaced it is the pointer's job.
+ */
+export const ARTIFACT_STATUSES = ['Draft', 'Current', 'Retired'] as const
+export type ArtifactStatus = (typeof ARTIFACT_STATUSES)[number]
+/** Retired: kept for traceability, no longer the version to go by, so links to it show muted. */
+/** A stepped diagram's `step_view`: `fixed` (the default) leaves the view where it is as the steps change; `follow` frames each step. */
+export const STEP_VIEWS = ['fixed', 'follow'] as const
+export type StepViewMode = (typeof STEP_VIEWS)[number]
+export const isPastArtifact = (status: ArtifactStatus) => status === 'Retired'
+
+/** How the board shows an artifact, from its file's extension (or its inline mermaid source). */
+export type ArtifactFormat = 'svg' | 'raster' | 'mermaid' | 'markdown' | 'pdf'
+
+/** The file extensions an artifact may have, by format. */
+export const ARTIFACT_EXTENSIONS: Record<Exclude<ArtifactFormat, 'mermaid'>, readonly string[]> = {
+  svg: ['.svg'],
+  raster: ['.png', '.jpg', '.jpeg', '.webp'],
+  markdown: ['.md'],
+  pdf: ['.pdf'],
+}
+
+/** x, y, width, height in the artifact's own units: SVG viewBox units, image pixels, or PDF points (top left origin). */
+export type Box = [number, number, number, number]
+
+export interface Rect {
+  x: number
+  y: number
+  w: number
+  h: number
+}
+
+/**
+ * A named spot inside an artifact that items can link to, drawn as a red box. `around` lists
+ * anchors (`text=`, `quote=`, `heading=`, `node=`, or a CSS selector) and the box goes round all
+ * their matches together, like a capture recipe's highlight; `box` is the fallback, or the only
+ * way for an image. `page` places it in a PDF.
+ */
+export interface Region {
+  id: string
+  name: string
+  around: string[]
+  box: Box | null
+  page: number | null
+  /** Space between the matches and the box, in the artifact's units. Unset: `HIGHLIGHT.pad`. */
+  pad: number | null
+  /** A line on what the spot shows. */
+  note: string
+}
+
+/** One row of a step's balances table: plain text both sides (`Bank`, `$100`). */
+export interface StepBalance {
+  account: string
+  amount: string
+}
+
+/**
+ * Something that travels at a step: on stepping forward onto the step, the `to` element(s) set
+ * off from the `from` element's place and size and fly to their own. Both are anchors (as in
+ * `show`); `from` uses its first match, and each match of `to` flies.
+ */
+export interface StepMove {
+  from: string
+  to: string
+}
+
+/**
+ * One step of a stepped diagram (an SVG only). Reveal is cumulative: anything a step's `show`
+ * names starts hidden and stays revealed from that step on. `highlight` keeps its anchors at full
+ * strength at this step only, and the rest dims. A step is a spot, in the same namespace as region
+ * IDs (`AR-01#step-id`). See `shared/steps.ts`.
+ */
+export interface Step {
+  /** Same shape as a region ID (`isRegionId`). */
+  id: string
+  name: string
+  /** A section label; consecutive steps with one label group together. '' when none. */
+  group: string
+  /** Markdown, links allowed. '' when none. */
+  caption: string
+  /** Anchors revealed at this step and kept revealed after. */
+  show: string[]
+  /** Anchors at full strength at this step only. */
+  highlight: string[]
+  /** What travels on arriving at this step by stepping forward, in order. */
+  moves: StepMove[]
+  balances: StepBalance[]
+}
+
+export interface Artifact {
+  id: string
+  /** The artifact's name, independent of its file name. */
+  title: string
+  kind: ArtifactKind
+  status: ArtifactStatus
+  /** The artifact that replaced this one (Retired only, and only when something did). */
+  supersededBy: string | null
+  /**
+   * When the artifact itself was made: a meeting's date for its transcript or notes, a document's
+   * publication, a diagram's drawing. `YYYY-MM-DD`, or `YYYY-MM` or `YYYY` when that is all that is
+   * known. Null when not given.
+   */
+  date: string | null
+  author: string
+  components: string[]
+  sources: string[]
+  /**
+   * How sources cite this artifact (`cited_as`): each entry a prefix a source string starts with,
+   * so `"RFP p.27 · ..."` opens this artifact at a page. See `shared/sources.ts`.
+   */
+  citedAs: Citation[]
+  /**
+   * The file it shows. Relative to the requirements folder (`artifacts/files/AR-01.svg`, `notes/x.md`), or
+   * to the repository root with a leading slash (`/docs/rfp-reference/RFP.pdf`). Null for a
+   * mermaid diagram, whose source sits in the sidecar.
+   */
+  file: string | null
+  regions: Region[]
+  /** A stepped diagram's steps, in order (SVG only); empty for any other artifact. */
+  steps: Step[]
+  /**
+   * How the view behaves as a stepped diagram steps (`step_view`): `fixed` (the default; also null,
+   * when the sidecar leaves it out) leaves the view where it is, `follow` frames each step. Kept as
+   * written, so `check` can name a value it does not know. See `STEP_VIEWS`.
+   */
+  stepView: string | null
+  /** Markdown, before any `## Source` section. */
+  description: string
+  /** The mermaid source (the fenced block under `## Source`), or empty. */
+  source: string
+  extra: Record<string, unknown>
+}
+
+export interface Heading {
+  depth: number
+  text: string
+  /** The automatic region ID: GitHub-style slug, made unique within the document. */
+  slug: string
+  /** The line it is on (from 1). */
+  line: number
+}
+
+/**
+ * One `cited_as` entry: sources starting with `as` resolve to this artifact. After the prefix a
+ * source may give a page (`p.27`, plus `pageOffset` for a printed page that runs behind the PDF's),
+ * numbered points (`#2 #3`, looked for under the `within` heading when set) or lines (`L27-33`);
+ * with none of those it opens `spot`, else the `within` section, else the whole artifact.
+ */
+export interface Citation {
+  as: string
+  pageOffset: number | null
+  within: string | null
+  spot: string | null
+}
+
+/** A numbered point in a note: a top-level `n.` list item, from its line to its last. */
+export interface NotePoint {
+  n: number
+  from: number
+  to: number
+  /** Its bold lead (or opening words), plain. */
+  title: string
+}
+
+/** What the server worked out from an artifact's file, for the board (format, size, pages, headings). */
+export interface ArtifactMeta {
+  format: ArtifactFormat | null
+  /** Hash of the file's bytes (git's blob hash), so a changed file reloads. Null for mermaid or a missing file. */
+  fileRev: string | null
+  /** The drawing's extent (SVG viewBox, image pixels). */
+  bounds: Rect | null
+  /** PDF page sizes in points. */
+  pages: { w: number; h: number }[] | null
+  /** Markdown headings, the document's automatic regions (with line ranges, `L12-20`). */
+  headings: Heading[] | null
+  /** A Markdown document's line count. */
+  lines: number | null
+  /** A Markdown document's numbered points (top-level `n.` items), which sources cite as `#n`. */
+  points: NotePoint[] | null
+  bytes: number | null
+  /** Repository-relative path of the file, for display and history. */
+  path: string | null
+}
+
+export interface ArtifactRec extends Rev<Artifact> {
+  meta: ArtifactMeta
+}
+
+export function artifactFormat(a: Pick<Artifact, 'file' | 'source'>): ArtifactFormat | null {
+  if (!a.file) return a.source.trim() ? 'mermaid' : null
+  const ext = a.file.slice(a.file.lastIndexOf('.')).toLowerCase()
+  for (const [format, exts] of Object.entries(ARTIFACT_EXTENSIONS)) if (exts.includes(ext)) return format as ArtifactFormat
+  return null
+}
+
+/** Canvas formats pan and zoom like a map; documents scroll like a page. */
+export const isCanvasFormat = (f: ArtifactFormat | null) => f === 'svg' || f === 'raster' || f === 'mermaid'
+
+/** `AR-01#price-rules` as its artifact and region (null for the whole artifact). */
+export function parseArtifactRef(ref: string): { id: string; region: string | null } {
+  const at = ref.indexOf('#')
+  return at < 0 ? { id: ref.trim(), region: null } : { id: ref.slice(0, at).trim(), region: ref.slice(at + 1).trim() || null }
+}
+
+export const artifactRef = (id: string, region: string | null) => (region ? `${id}#${region}` : id)
+
+/** A PDF page's automatic region ID. */
+export const pageRegionId = (n: number) => `p${n}`
+export const pageOfRegionId = (id: string): number | null => (/^p\d+$/.test(id) ? Number(id.slice(1)) : null)
+
+/** A Markdown document's automatic line-range region, `L27` or `L27-33` (as the notes cite transcript lines). */
+export function linesOfRegionId(id: string): { from: number; to: number } | null {
+  const m = /^L(\d+)(?:-L?(\d+))?$/.exec(id)
+  if (!m) return null
+  const from = Number(m[1])
+  const to = m[2] ? Number(m[2]) : from
+  return from >= 1 && to >= from ? { from, to } : null
+}

@@ -1,0 +1,432 @@
+/**
+ * Catalogue integrity rules. Run by `npm run check`, by the dev server before
+ * every write, and shown live in the app. Component and screenshot-app names
+ * are checked against the project's `board.config.json` when it lists them.
+ */
+import {
+  ARTIFACT_EXTENSIONS,
+  ARTIFACT_KINDS,
+  ARTIFACT_STATUSES,
+  PARENT_TYPES,
+  ITEM_TYPES,
+  QUESTION_KINDS,
+  STEP_VIEWS,
+  VIEWPORTS,
+  artifactFormat,
+  isPastArtifact,
+  linesOfRegionId,
+  pageOfRegionId,
+  parseArtifactRef,
+  type Artifact,
+  type ArtifactFormat,
+  type Heading,
+  type Issue,
+  type Item,
+  type NotePoint,
+  type Question,
+  type Rect,
+} from './types.ts'
+import { isArtifactId, isQuestionId, itemTexts, mentions } from './links.ts'
+import { buildSourceIndex, citationProblems, resolveSource, type SpotFacts } from './sources.ts'
+import { appKeys, componentNames, DEFAULT_CONFIG, voiceRegex, type BoardConfig } from './config.ts'
+import { isAnswered, isRetired, statusCodes } from './statuses.ts'
+import { stepOf, stepState } from './steps.ts'
+import { ANCHOR_FORMATS, boxRect, isRegionId, looseText, matchSimpleSelector, normText, parseAnchor, rectWithin, type SvgElement } from './artifacts.ts'
+
+export const ID_PATTERNS = {
+  epic: /^EP-\d{2}$/,
+  feature: /^FT-\d{2}\.\d+$/,
+  story: /^US-\d{2}\.\d+\.\d+$/,
+  question: /^OQ-\d{2,}$/,
+  artifact: /^AR-\d{2,}$/,
+} as const
+
+/**
+ * What the server read from an artifact's file (or mermaid source), for checking its regions.
+ * Null from `artifactFacts` means "not read", so the file-dependent rules are skipped (the browser).
+ */
+export interface ArtifactFacts {
+  format: ArtifactFormat | null
+  /** The file is there and readable as its format. False with `error` when not. */
+  ok: boolean
+  error?: string
+  bounds: Rect | null
+  svg?: { texts: string[]; elements: SvgElement[] }
+  /** Mermaid flowchart node IDs; null for diagram types whose IDs are not read. */
+  nodeIds?: Set<string> | null
+  markdown?: { headings: Heading[]; loose: string; lines: number; points?: NotePoint[] }
+  pdf?: { pages: { w: number; h: number; loose: string }[] }
+}
+
+export interface CheckInput {
+  items: Item[]
+  questions: Question[]
+  /** Returns whether a catalogue-relative path exists. Omit to skip image checks (browser). */
+  fileExists?: (relPath: string) => boolean
+  /** The board's named swim lanes (`board-layout.json`). Omit to skip the lane check. */
+  lanes?: string[]
+  artifacts?: Artifact[]
+  /** What each artifact's file holds. Omit (or return null) to skip the file and region checks. */
+  artifactFacts?: (a: Artifact) => ArtifactFacts | null
+  /** The project's vocabulary. Omit (or leave a list empty) to accept any component or screenshot app. */
+  config?: BoardConfig
+}
+
+export function checkCatalogue({ items, questions, fileExists, lanes, artifacts = [], artifactFacts, config = DEFAULT_CONFIG }: CheckInput): Issue[] {
+  const issues: Issue[] = []
+  const components = componentNames(config)
+  const itemCodes = statusCodes(config, 'item')
+  const questionCodes = statusCodes(config, 'question')
+  const retired = (it: Item) => isRetired(config, it)
+  const apps = appKeys(config)
+  const unknownComponent = (c: string) => components.length > 0 && !components.includes(c)
+  const err = (id: string, message: string) => issues.push({ severity: 'error', id, message })
+  const warn = (id: string, message: string) => issues.push({ severity: 'warning', id, message })
+
+  const byId = new Map<string, Item>()
+  for (const it of items) {
+    if (byId.has(it.id)) err(it.id, `duplicate ID ${it.id}`)
+    byId.set(it.id, it)
+  }
+
+  for (const it of items) {
+    if (!ITEM_TYPES.includes(it.type)) {
+      err(it.id, `type "${it.type}" is not one of ${ITEM_TYPES.join(', ')}`)
+      continue
+    }
+    if (!ID_PATTERNS[it.type].test(it.id)) err(it.id, `ID ${it.id} does not match the ${it.type} pattern`)
+    if (!it.title.trim()) err(it.id, 'title is empty')
+    if (!itemCodes.includes(it.status)) err(it.id, `status "${it.status}" is not one of ${itemCodes.join(', ')} (statuses in board.config.json)`)
+    for (const c of it.components) {
+      if (unknownComponent(c)) err(it.id, `component "${c}" is not in the vocabulary (board.config.json)`)
+    }
+    if (it.components.length === 0) warn(it.id, 'no component')
+    if (it.sources.length === 0 && !retired(it)) warn(it.id, 'no source')
+
+    if (it.type === 'epic') {
+      if (it.parent) err(it.id, 'an epic has no parent')
+    } else if (!it.parent) {
+      err(it.id, `a ${it.type} needs a parent`)
+    } else {
+      const parent = byId.get(it.parent)
+      if (!parent) err(it.id, `parent ${it.parent} does not exist`)
+      else if (!PARENT_TYPES[it.type].includes(parent.type)) {
+        const allowed = PARENT_TYPES[it.type].join(' or ')
+        err(it.id, `a ${it.type}'s parent must be ${/^[aeiou]/.test(allowed) ? 'an' : 'a'} ${allowed}, ${it.parent} is a ${parent.type}`)
+      }
+    }
+
+    if (it.swimlane !== null) {
+      if (it.type !== 'story') warn(it.id, `swimlane "${it.swimlane}" is set on ${it.type === 'epic' ? 'an' : 'a'} ${it.type}; only stories sit in lanes, so the board ignores it`)
+      else if (lanes && !lanes.includes(it.swimlane)) warn(it.id, `swimlane "${it.swimlane}" is not a lane on the board; add it on the Mapped board or fix the name`)
+    }
+
+    for (const img of it.images) {
+      if (!img.src) err(it.id, 'image with no src')
+      else if (!img.src.startsWith('assets/')) err(it.id, `image ${img.src} must live under assets/ (the board only serves that folder)`)
+      else if (fileExists && !fileExists(img.src)) err(it.id, `image file ${img.src} is missing`)
+      if (!VIEWPORTS.includes(img.viewport)) err(it.id, `image viewport "${img.viewport}" is not desktop or mobile`)
+      const app = img.app === undefined ? undefined : config.screenshotApps.find((a) => a.key === img.app)
+      if (img.app !== undefined && apps.length > 0 && !app) err(it.id, `image app "${img.app}" is not one of ${apps.join(', ')}`)
+      else if (app && img.viewport !== app.viewport) warn(it.id, `image ${img.src} is from the ${app.label} app, a ${app.viewport} app, but its viewport is ${img.viewport}`)
+    }
+  }
+
+  const qIds = new Set<string>()
+  for (const q of questions) {
+    if (qIds.has(q.id)) err(q.id, `duplicate ID ${q.id}`)
+    qIds.add(q.id)
+  }
+
+  // Related items: stored on one side, shown on both.
+  const pairs = new Set<string>()
+  for (const it of items) {
+    const seen = new Set<string>()
+    for (const r of it.related) {
+      if (seen.has(r)) warn(it.id, `related lists ${r} twice`)
+      seen.add(r)
+      if (r === it.id) err(it.id, 'related lists the item itself')
+      else if (isQuestionId(r)) err(it.id, `related lists ${r}, an outstanding item; list the item under its affects instead`)
+      else if (!byId.has(r)) err(it.id, `related lists ${r}, which does not exist`)
+      else {
+        if (retired(byId.get(r)!) && !retired(it)) warn(it.id, `related lists ${r}, which is retired`)
+        if (pairs.has(`${r}|${it.id}`)) warn(it.id, `related lists ${r}, which already lists this item; keep it on one side`)
+        pairs.add(`${it.id}|${r}`)
+      }
+    }
+  }
+
+  // Artifacts: the sidecar's own fields, its file, and every region against what the file holds.
+  const artById = new Map<string, Artifact>()
+  for (const a of artifacts) {
+    if (artById.has(a.id)) err(a.id, `duplicate ID ${a.id}`)
+    artById.set(a.id, a)
+  }
+  const factsOf = new Map<string, ArtifactFacts | null>()
+  for (const a of artifacts) factsOf.set(a.id, artifactFacts ? artifactFacts(a) : null)
+  /** Region IDs that resolve: the named ones and the steps, plus each PDF page and Markdown heading. */
+  const regionExists = (a: Artifact, region: string) => {
+    if (a.regions.some((r) => r.id === region) || stepOf(a, region)) return true
+    const f = factsOf.get(a.id)
+    const page = pageOfRegionId(region)
+    if (page !== null) return !f || !f.pdf ? (f ? false : true) : page >= 1 && page <= f.pdf.pages.length
+    const lines = linesOfRegionId(region)
+    if (lines) return f?.markdown ? lines.to <= f.markdown.lines : !f
+    return f?.markdown ? f.markdown.headings.some((h) => h.slug === region) : !f
+  }
+  const artifactRefProblem = (ref: string): string | null => {
+    const { id, region } = parseArtifactRef(ref)
+    const a = artById.get(id)
+    if (!a) return 'that artifact does not exist'
+    if (region !== null && !regionExists(a, region)) return `${a.id} has no region "${region}"`
+    return null
+  }
+
+  /**
+   * One anchor of a region's `around` or a step's `show` / `highlight` / `moves`, against what the
+   * file holds. `many`: what to say when it matches more than one thing (a region's box spans them
+   * all; a move sets off from the first), or null when that is fine (a step often reveals a class or
+   * several elements).
+   */
+  const checkAnchor = (a: Artifact, format: ArtifactFormat | null, f: ArtifactFacts | null | undefined, label: string, anchor: string, opts: { many: 'box' | 'first' | null; page?: number | null; pdfPage?: { loose: string } }) => {
+    const spans = (n: number, what: string) => (opts.many === 'first' ? `${label} matches ${n} ${what}, and only the first is used` : `${label} matches ${n} ${what}, and the box spans them all`)
+    const { kind, value } = parseAnchor(anchor)
+    if (!value.trim()) {
+      err(a.id, `${label} is empty`)
+      return
+    }
+    if (format && !ANCHOR_FORMATS[kind].includes(format)) {
+      err(a.id, `${label} does not apply to ${format === 'raster' ? 'an image' : `a ${format === 'markdown' ? 'Markdown document' : format.toUpperCase()}`}${format === 'raster' ? '; use a box' : ''}`)
+      return
+    }
+    if (!f) return
+    if (kind === 'text' && f.svg) {
+      const n = f.svg.texts.filter((t) => t === normText(value)).length
+      if (!n) err(a.id, `${label} matches no text in the drawing`)
+      else if (n > 1 && opts.many) warn(a.id, spans(n, 'texts'))
+    } else if (kind === 'css' && f.svg) {
+      const n = matchSimpleSelector(value, f.svg.elements)
+      if (n === 0) err(a.id, `${label} matches nothing in the drawing`)
+      else if (n === null) warn(a.id, `${label} is not checked here; the board resolves it`)
+      else if (n > 1 && opts.many) warn(a.id, spans(n, 'elements'))
+    } else if (kind === 'node') {
+      if (f.nodeIds === null) warn(a.id, `${label} is not checked: only flowchart node IDs are read`)
+      else if (f.nodeIds && !f.nodeIds.has(value.trim())) err(a.id, `${label}: the diagram has no node ${value.trim()}`)
+    } else if (kind === 'heading' && f.markdown) {
+      if (!f.markdown.headings.some((h) => h.text === normText(value))) err(a.id, `${label} matches no heading in the document`)
+    } else if (kind === 'quote') {
+      const q = looseText(value)
+      if (f.markdown && !f.markdown.loose.includes(q)) err(a.id, `${label} is not in the document`)
+      if (f.pdf && opts.pdfPage && !opts.pdfPage.loose.includes(q)) err(a.id, `${label} is not on page ${opts.page}`)
+    }
+  }
+
+  for (const a of artifacts) {
+    if (!ID_PATTERNS.artifact.test(a.id)) err(a.id, `ID ${a.id} does not match AR-nn`)
+    if (!a.title.trim()) err(a.id, 'title is empty')
+    if (!ARTIFACT_KINDS.includes(a.kind)) err(a.id, `kind "${a.kind}" is not one of ${ARTIFACT_KINDS.join(', ')}`)
+    if ((a.status as string) === 'Superseded') err(a.id, 'status "Superseded" is gone: a replaced artifact is Retired, with superseded_by naming its replacement')
+    else if (!ARTIFACT_STATUSES.includes(a.status)) err(a.id, `status "${a.status}" is not one of ${ARTIFACT_STATUSES.join(', ')}`)
+    for (const c of a.components) if (unknownComponent(c)) err(a.id, `component "${c}" is not in the vocabulary (board.config.json)`)
+    if (a.sources.length === 0 && !isPastArtifact(a.status)) warn(a.id, 'no source')
+    if (a.date === null) warn(a.id, 'no date: when it was made (a meeting, a publication, a drawing)')
+    else if (!isArtifactDate(a.date)) err(a.id, `date "${a.date}" is not YYYY-MM-DD, YYYY-MM or YYYY`)
+    if (a.supersededBy !== null) {
+      if (a.supersededBy === a.id) err(a.id, 'superseded_by names the artifact itself')
+      else if (!artById.has(a.supersededBy)) err(a.id, `superseded_by ${a.supersededBy}, which does not exist`)
+      if (a.status !== 'Retired') warn(a.id, `superseded_by is set but the status is ${a.status}, not Retired`)
+    }
+
+    const format = artifactFormat(a)
+    if (a.file && a.source.trim()) err(a.id, 'has both a file and a mermaid source; keep one')
+    else if (!a.file && !a.source.trim()) err(a.id, 'has neither a file nor a mermaid source under ## Source')
+    else if (a.file && !format) {
+      const exts = Object.values(ARTIFACT_EXTENSIONS).flat().join(', ')
+      err(a.id, `file ${a.file} is not a kind the board shows (${exts})`)
+    }
+    const f = factsOf.get(a.id)
+    if (f && !f.ok) err(a.id, f.error ?? `file ${a.file} cannot be read`)
+
+    const seen = new Set<string>()
+    for (const r of a.regions) {
+      const where = `region ${r.id || '(no id)'}`
+      if (!isRegionId(r.id)) err(a.id, `${where}: the id must be lower-case words joined by hyphens`)
+      else if (seen.has(r.id)) err(a.id, `${where} is listed twice`)
+      else if (pageOfRegionId(r.id) !== null || f?.markdown?.headings.some((h) => h.slug === r.id)) err(a.id, `${where}: the id is taken by a page or heading of the document; name it differently`)
+      seen.add(r.id)
+      if (!r.name) err(a.id, `${where} has no name`)
+      if (!r.around.length && !r.box) err(a.id, `${where} needs anchors (around) or a box`)
+      if (r.pad !== null && !(r.pad >= 0)) err(a.id, `${where}: pad must be a number, 0 or more`)
+      if (r.page !== null && format !== 'pdf') err(a.id, `${where}: page only applies to a PDF`)
+      if (format === 'pdf' && r.page === null) err(a.id, `${where}: a PDF region needs a page`)
+      if (r.page !== null && !(Number.isInteger(r.page) && r.page >= 1)) err(a.id, `${where}: page must be a whole number from 1`)
+      const pdfPage = f?.pdf && r.page !== null ? f.pdf.pages[r.page - 1] : undefined
+      if (f?.pdf && r.page !== null && Number.isInteger(r.page) && !pdfPage) err(a.id, `${where}: page ${r.page} is past the end (${f.pdf.pages.length} pages)`)
+
+      if (r.box) {
+        if (!r.box.every(Number.isFinite) || r.box[2] <= 0 || r.box[3] <= 0) err(a.id, `${where}: box must be four numbers, x y width height, with a width and height above 0`)
+        else if (format === 'markdown') err(a.id, `${where}: a Markdown document has no coordinates; use quote= or heading=`)
+        else {
+          const within = format === 'pdf' ? (pdfPage ? { x: 0, y: 0, w: pdfPage.w, h: pdfPage.h } : null) : (f?.bounds ?? null)
+          if (within && !rectWithin(boxRect(r.box), within)) err(a.id, `${where}: the box lies outside the ${format === 'pdf' ? 'page' : 'drawing'}`)
+        }
+      }
+
+      for (const anchor of r.around) checkAnchor(a, format, f, `${where}: anchor "${anchor}"`, anchor, { many: 'box', page: r.page, pdfPage })
+    }
+
+    if (a.steps.length && format !== 'svg') err(a.id, `has steps, but steps only work on an SVG drawing`)
+    if (a.stepView !== null) {
+      if (!(STEP_VIEWS as readonly string[]).includes(a.stepView)) err(a.id, `step_view is "${a.stepView}"; it is fixed (the default) or follow`)
+      else if (!a.steps.length) err(a.id, `has step_view but no steps; step_view only applies to a stepped diagram`)
+    }
+    const stepIds = new Set<string>()
+    a.steps.forEach((s, i) => {
+      const where = `step ${s.id || '(no id)'}`
+      if (!isRegionId(s.id)) err(a.id, `${where}: the id must be lower-case words joined by hyphens`)
+      else if (stepIds.has(s.id)) err(a.id, `${where} is listed twice`)
+      else if (seen.has(s.id)) err(a.id, `${where}: the id is taken by a region; steps and regions share one set of spots, so name it differently`)
+      else if (pageOfRegionId(s.id) !== null || linesOfRegionId(s.id)) err(a.id, `${where}: the id is shaped like a page or line spot; name it differently`)
+      stepIds.add(s.id)
+      if (!s.name) err(a.id, `${where} has no name`)
+      if (s.balances.some((b) => !b.account)) err(a.id, `${where}: a balance row has no account`)
+      if (format !== 'svg') return
+      for (const anchor of s.show) checkAnchor(a, format, f, `${where}: show anchor "${anchor}"`, anchor, { many: null })
+      const { hidden } = stepState(a.steps, i)
+      for (const anchor of s.highlight) {
+        checkAnchor(a, format, f, `${where}: highlight anchor "${anchor}"`, anchor, { many: null })
+        if (hidden.includes(anchor.trim())) warn(a.id, `${where}: highlight anchor "${anchor}" is not revealed until a later step, so it is hidden when highlighted here`)
+      }
+      // A move: the `to` element(s) fly from the `from` element's place on stepping forward onto this step.
+      s.moves.forEach((m, j) => {
+        const mv = `${where}: move ${j + 1}`
+        if (!m.from.trim() || !m.to.trim()) {
+          err(a.id, `${mv} needs both from and to`)
+          return
+        }
+        checkAnchor(a, format, f, `${mv}: from "${m.from}"`, m.from, { many: 'first' })
+        checkAnchor(a, format, f, `${mv}: to "${m.to}"`, m.to, { many: null })
+        if (hidden.includes(m.from.trim())) warn(a.id, `${mv}: from "${m.from}" is not revealed until a later step, so there is nothing to set off from`)
+        if (hidden.includes(m.to.trim())) warn(a.id, `${mv}: to "${m.to}" is not revealed until a later step, so nothing travels`)
+      })
+    })
+  }
+
+  // Items point at artifacts in their frontmatter; the board shows the link on both sides.
+  for (const it of items) {
+    const seen = new Set<string>()
+    for (const ref of it.artifacts ?? []) {
+      if (seen.has(ref)) warn(it.id, `artifacts lists ${ref} twice`)
+      seen.add(ref)
+      if (!/^AR-\d{2,}(#[A-Za-z0-9-]+)?$/.test(ref)) {
+        err(it.id, `artifacts entry "${ref}" is not AR-nn or AR-nn#region`)
+        continue
+      }
+      const problem = artifactRefProblem(ref)
+      if (problem) err(it.id, `artifacts lists ${ref}: ${problem}`)
+      else if (!retired(it)) {
+        const target = artById.get(parseArtifactRef(ref).id)!
+        if (target.status === 'Retired') warn(it.id, `artifacts lists ${ref}, which is retired${target.supersededBy ? ` and superseded by ${target.supersededBy}` : ''}`)
+      }
+    }
+  }
+
+  // Links in the text. A question can be deleted, so a link to a missing one warns rather than blocking the delete.
+  // A bare mention of a retired item is history ("merges the former US-01.3.4"), so only a link to one warns.
+  // Links in an artifact's description only warn: the board cannot rewrite an artifact, so they must never block a save or a delete.
+  const linksIn = (id: string, texts: string[], live: boolean, soft = false) => {
+    const fail = soft ? warn : err
+    for (const m of mentions(texts.join('\n\n'))) {
+      const how = m.bare ? 'mentions' : 'links to'
+      if (isArtifactId(m.id)) {
+        const problem = artifactRefProblem(m.id)
+        if (problem) (m.bare ? warn : fail)(id, `the text ${how} ${m.id}: ${problem}`)
+        else if (live && !m.bare) {
+          const status = artById.get(parseArtifactRef(m.id).id)!.status
+          if (isPastArtifact(status)) warn(id, `the text links to ${m.id}, which is ${status.toLowerCase()}`)
+        }
+      } else if (isQuestionId(m.id)) {
+        if (!qIds.has(m.id)) warn(id, `the text ${how} ${m.id}, which does not exist`)
+      } else if (!byId.has(m.id)) {
+        if (m.bare) warn(id, `the text mentions ${m.id}, which does not exist`)
+        else fail(id, `the text links to ${m.id}, which does not exist`)
+      } else if (live && !m.bare && retired(byId.get(m.id)!)) warn(id, `the text links to ${m.id}, which is retired`)
+    }
+  }
+  for (const it of items) linksIn(it.id, itemTexts(it), !retired(it))
+  // A step's caption is Markdown like the description, so its links get the same checks.
+  for (const a of artifacts) linksIn(a.id, [a.description, ...a.steps.map((s) => s.caption)], !isPastArtifact(a.status), true)
+  for (const q of questions) linksIn(q.id, [q.question, q.answer], !isAnswered(config, q))
+
+  // Voice: project patterns that mark provenance or decision history in a description (board.config.json `voice`).
+  // Only the description, and only on live cards: Notes and sources are where that history belongs.
+  const voiceRules = config.voice.descriptionWarnings.flatMap((rule) => {
+    const re = voiceRegex(rule)
+    return typeof re === 'string' ? [] : [{ rule, re }]
+  })
+  if (voiceRules.length) {
+    for (const it of items) {
+      if (retired(it) || !it.description) continue
+      for (const { rule, re } of voiceRules) {
+        re.lastIndex = 0
+        const m = re.exec(it.description)
+        if (m) warn(it.id, `description has ${rule.message} ("${snippet(m[0])}"): move provenance and history to Notes`)
+      }
+    }
+  }
+
+  for (const q of questions) {
+    if (!ID_PATTERNS.question.test(q.id)) err(q.id, `ID ${q.id} does not match OQ-nn`)
+    if (!QUESTION_KINDS.includes(q.kind)) err(q.id, `kind "${q.kind}" is not one of ${QUESTION_KINDS.join(', ')}`)
+    if (!q.title.trim()) err(q.id, 'title is empty')
+    if (!questionCodes.includes(q.status)) err(q.id, `status "${q.status}" is not one of ${questionCodes.join(', ')} (questionStatuses in board.config.json)`)
+    for (const a of q.affects) if (!byId.has(a)) err(q.id, `affects ${a}, which does not exist`)
+    if (q.affects.length === 0) warn(q.id, 'affects no items')
+    if (isAnswered(config, q) && !q.answer.trim()) warn(q.id, 'answered but the answer is empty')
+  }
+
+  // Sources open the artifact spot they cite (shared/sources.ts). Only warnings: a source line never blocks a save.
+  if (artifacts.length) {
+    const sources = buildSourceIndex(artifacts, (id) => spotFactsOf(factsOf.get(id) ?? null))
+    for (const a of artifacts) for (const p of citationProblems(a, spotFactsOf(factsOf.get(a.id) ?? null), artifactFormat(a) === 'pdf')) err(a.id, p)
+    for (const c of sources.clashes) for (const id of c.ids) err(id, `cited_as "${c.prefix}" is also claimed by ${c.ids.filter((x) => x !== id).join(', ')}`)
+    const sourcesOf = (id: string, list: string[], self?: string) => {
+      for (const s of list) {
+        const r = resolveSource(sources, s, self)
+        if (r.kind === 'unresolved') warn(id, `source "${s}" ${r.reason}`)
+        else if (r.kind === 'question' && !qIds.has(r.id)) warn(id, `source ${r.id} names a question that does not exist`)
+        else if (r.kind === 'artifact') for (const spot of r.spots) if (spot.problem) warn(id, `source "${s}": ${spot.problem}`)
+      }
+    }
+    for (const it of items) sourcesOf(it.id, it.sources)
+    for (const q of questions) sourcesOf(q.id, q.sources)
+    for (const a of artifacts) sourcesOf(a.id, a.sources, a.id)
+  }
+
+  return issues
+}
+
+/** Matched text for a message: one line, at most about 40 characters. */
+function snippet(text: string, max = 40): string {
+  const t = text.replace(/\s+/g, ' ').trim()
+  return t.length > max ? `${t.slice(0, max - 1).trimEnd()}…` : t
+}
+
+/** What the check knows of a file, as the source resolver reads it. */
+function spotFactsOf(f: ArtifactFacts | null): SpotFacts | null {
+  if (!f) return null
+  return { pages: f.pdf?.pages.length ?? null, headings: f.markdown?.headings ?? null, points: f.markdown?.points ?? null, lines: f.markdown?.lines ?? null }
+}
+
+/** `YYYY-MM-DD`, `YYYY-MM` or `YYYY`, and a real day. */
+export function isArtifactDate(s: string): boolean {
+  const m = /^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?$/.exec(s)
+  if (!m) return false
+  const month = m[2] ? Number(m[2]) : 1
+  const day = m[3] ? Number(m[3]) : 1
+  const d = new Date(Date.UTC(Number(m[1]), month - 1, day))
+  return month >= 1 && month <= 12 && d.getUTCMonth() === month - 1 && d.getUTCDate() === day
+}
+
+export const hasErrors = (issues: Issue[]) => issues.some((i) => i.severity === 'error')
+export const issueKey = (i: Issue) => `${i.severity}|${i.id}|${i.message}`

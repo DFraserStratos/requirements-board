@@ -1,0 +1,662 @@
+/**
+ * The catalogue file API, independent of Vite so it can be tested directly.
+ * `cataloguePlugin.ts` wires it to the dev server's middleware and watcher.
+ *
+ *   GET  /api/catalogue          everything, parsed, with a rev per record
+ *   PUT  /api/items/:id          { record, baseRev }  409 if the file on disk is not at baseRev
+ *   POST /api/items/batch        { changes: [{ id, baseRev, patch }] }  all or nothing (a Mapped board move)
+ *   POST /api/items              { type, parent, title, ... }  server assigns the ID
+ *   DELETE /api/items/:id       { baseRev, ids }  removes it and everything under it (`ids`: the set the user
+ *                                was shown, 409 if that is no longer it) and every reference to them
+ *   PUT  /api/questions/:id      { record, baseRev }
+ *   DELETE /api/questions/:id   { baseRev }  removes the file; 409 if it changed on disk since baseRev
+ *   POST /api/questions          { title, ... }
+ *   GET  /api/items/:id/history  the card's timeline: the change journal, backfilled from git
+ *   GET  /api/artifacts/:id/history  an artifact's timeline from git: its sidecar and its file
+ *   GET  /api/diff/commits       the commits that changed catalogue records, newest first along HEAD's first
+ *                                parents, each with its first parent, and HEAD (Diff review)
+ *   GET  /api/diff?from=&to=     every record that differs between two commits, or a commit and the files
+ *                                on disk (`to=worktree`), with both versions (Diff review)
+ *   GET  /api/diff/count?from=&to=  { available, count }: how many records differ, minor changes left out
+ *                                (From defaults to HEAD, To to `worktree`): the Diff review tab's count
+ *   GET  /api/diff/auto          the Diff review's default: HEAD against the files on disk, or with nothing
+ *                                there what the last catalogue commit changed (`jumped: true`)
+ *   PUT  /api/artifacts/:id      { record, baseRev }  its details only (title, kind, status, date, author,
+ *                                area, sources, description); its file, regions and source stay as on disk
+ *   PUT  /api/config             { project?, components?, statuses?, questionStatuses? }  replaces those lists in board.config.json (the
+ *                                rest of the file is kept); 422 if a list breaks the rules or drops a status in use
+ *   PUT  /api/layout             { positions?: { id: {x,y} | null }, lanes?: string[], firstLane?: string | null }
+ *                                positions are a patch (null restores the story-map place); lanes replace the
+ *                                list; firstLane renames the implicit first lane (null: back to Unassigned)
+ *
+ * Every write re-reads the target file first (so an edit made on disk a moment
+ * ago is never overwritten), checks the record would survive a round trip,
+ * and runs the integrity rules on exactly what will be written.
+ */
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { checkCatalogue, issueKey } from '../shared/check.ts'
+import { artifactRoundTripProblems, itemRoundTripProblems, normaliseItem, normaliseQuestion, parseItem, parseQuestion, questionRoundTripProblems, serialiseItem, serialiseQuestion, withArtifactDetails } from '../shared/files.ts'
+import { compareSiblings, nextItemId, nextQuestionId } from '../shared/ids.ts'
+import { buildArtifactTimeline, buildTimeline, diffItems } from '../shared/history.ts'
+import { defaultStatus, normaliseStatus, readStatusList, statusLabel, type StatusDef, type StatusKind } from '../shared/statuses.ts'
+import { parseArtifact, revOf } from '../shared/files.ts'
+import { ACCENT_PATTERN, parseConfig } from '../shared/config.ts'
+import { laneListProblem } from '../shared/move.ts'
+import { planDelete } from '../shared/remove.ts'
+import { ITEM_TYPES, UNASSIGNED_LANE, firstLaneName, type Artifact, type ArtifactRec, type Layout, type CatalogueEvent, type Item, type ItemType, type Question, type Rev } from '../shared/types.ts'
+import {
+  FileExistsError,
+  artifactCheck,
+  artifactSidecarPath,
+  configPath,
+  formatJson,
+  deleteItemAssets,
+  deleteItemFile,
+  deleteQuestionFile,
+  fileExistsIn,
+  issuesFor,
+  itemPath,
+  storiesDir,
+  layoutPath,
+  loadCatalogue,
+  questionPath,
+  questionsDir,
+  readArtifactFile,
+  readItemFile,
+  readLayout,
+  readQuestionFile,
+  readConfig,
+  readRecodes,
+  takenIds,
+  writeArtifact,
+  writeAtomic,
+  writeItem,
+  writeLayout,
+  writeQuestion,
+  type LoadResult,
+  type LoadedFile,
+} from './catalogueFs.ts'
+import { artifactInfo, artifactPath } from './artifactFiles.ts'
+import { gitAssetHistory, gitDirty, gitFileHistory, gitScreenshots } from './gitHistory.ts'
+import { DiffRefError, createDiffReader } from './catalogueDiff.ts'
+import { NO_JOURNAL, type Journal } from './historyJournal.ts'
+
+export class HttpError extends Error {
+  status: number
+  body: unknown
+  constructor(status: number, message: string, body?: unknown) {
+    super(message)
+    this.status = status
+    this.body = body
+  }
+}
+
+export interface ApiRequest {
+  method: string
+  path: string
+  body?: unknown
+  /** Lower-cased request headers; used to refuse cross-site writes. */
+  headers?: Record<string, string | undefined>
+  /** The URL's query parameters (read by the GET routes that take any). */
+  query?: Record<string, string>
+}
+
+const MAX_CREATE_ATTEMPTS = 5
+
+export interface ApiOptions {
+  /** Where card changes are journalled; omitted, nothing is kept (history is git only). */
+  journal?: Journal
+  /** A card file's git history (injectable for tests). */
+  gitHistory?: typeof gitFileHistory
+  /** A card's screenshot rewrites in git (injectable for tests). */
+  gitScreenshots?: typeof gitScreenshots
+  /** An artifact file's versions in git (injectable for tests). */
+  gitAssetHistory?: typeof gitAssetHistory
+  /**
+   * The caller reports every file change in the folder (and in artifacts' files) through
+   * `worktreeChanged()`, as the dev server's watcher does, so the Diff review can keep its
+   * comparisons with the files on disk until the next change. Otherwise it reads them afresh.
+   */
+  watched?: boolean
+}
+
+export function createCatalogueApi(root: string, emit: (e: CatalogueEvent) => void = () => {}, opts: ApiOptions = {}) {
+  let state: LoadResult = loadCatalogue(root)
+  const journal = opts.journal ?? NO_JOURNAL
+  const gitHistory = opts.gitHistory ?? gitFileHistory
+  const gitShots = opts.gitScreenshots ?? gitScreenshots
+  const gitAsset = opts.gitAssetHistory ?? gitAssetHistory
+  const diffs = createDiffReader(root, { watched: opts.watched })
+  journal.baseline(state.items)
+  journal.screenshots(join(root, 'assets'), { offline: true })
+
+  const itemList = () => Object.values(state.items).map((r) => r.data)
+  const readVoice = (): { text: string | null; rev: string | null } => {
+    try {
+      const text = readFileSync(join(root, 'VOICE.md'), 'utf8')
+      return { text, rev: revOf(text) }
+    } catch {
+      return { text: null, rev: null }
+    }
+  }
+  const questionList = () => Object.values(state.questions).map((r) => r.data)
+  const refreshIssues = () => {
+    state.issues = issuesFor(state.items, state.questions, state.parseIssues, root, state.layout.lanes, state.artifacts, state.config)
+  }
+
+  /** Refuse a change that would introduce an integrity error not already present. */
+  function guard(items: Item[], questions: Question[], artifacts: Record<string, Rev<Artifact>> = state.artifacts) {
+    const before = new Set(state.issues.map(issueKey))
+    const after = checkCatalogue({ items, questions, fileExists: fileExistsIn(root), lanes: state.layout.lanes, config: state.config, ...artifactCheck(artifacts, root) })
+    const added = after.filter((i) => i.severity === 'error' && !before.has(issueKey(i)))
+    if (added.length) throw new HttpError(422, added.map((i) => `${i.id}: ${i.message}`).join('\n'))
+  }
+
+  /** Normalise an untrusted record into exactly what will be written, or refuse it. */
+  function prepareItem(raw: unknown): Item {
+    const item = normaliseItem(raw)
+    const problems = itemRoundTripProblems(item)
+    if (problems.length) throw new HttpError(422, `${item.id}: ${problems.join('; ')}`)
+    return parseItem(serialiseItem(item))
+  }
+  function prepareQuestion(raw: unknown): Question {
+    const q = normaliseQuestion(raw)
+    const problems = questionRoundTripProblems(q)
+    if (problems.length) throw new HttpError(422, `${q.id}: ${problems.join('; ')}`)
+    return parseQuestion(serialiseQuestion(q))
+  }
+
+  /**
+   * The record as it is on disk right now. If that differs from what we hold
+   * (the watcher has not caught up yet), adopt it and tell the clients.
+   */
+  function checked<T extends { id: string }>(id: string, r: LoadedFile<T>): Rev<T> {
+    if (r.missing) throw new HttpError(404, `${id} does not exist`)
+    // 422, not 409: a 409 means "someone else changed it", which "Keep mine" can answer; this it cannot.
+    if (r.error || !r.record) throw new HttpError(422, `${id}.md cannot be read (${r.error}); fix the file on disk first`)
+    if (r.record.data.id !== id) throw new HttpError(422, `${id}.md holds id ${r.record.data.id}; fix the file on disk first`)
+    return r.record
+  }
+  function itemOnDisk(id: string): Rev<Item> {
+    const rec = checked(id, readItemFile(itemPath(id, root)))
+    if (state.items[id]?.rev !== rec.rev) {
+      state.items[id] = rec
+      journal.item(rec, 'disk')
+      refreshIssues()
+      emit({ kind: 'item', id, record: rec })
+      emit({ kind: 'issues', issues: state.issues })
+    }
+    return rec
+  }
+  function questionOnDisk(id: string): Rev<Question> {
+    const rec = checked(id, readQuestionFile(questionPath(id, root)))
+    if (state.questions[id]?.rev !== rec.rev) {
+      state.questions[id] = rec
+      refreshIssues()
+      emit({ kind: 'question', id, record: rec })
+      emit({ kind: 'issues', issues: state.issues })
+    }
+    return rec
+  }
+
+  function artifactOnDisk(id: string): ArtifactRec {
+    const rec = checked(id, readArtifactFile(artifactSidecarPath(id, root)))
+    if (state.artifacts[id]?.rev !== rec.rev) {
+      state.artifacts[id] = { ...rec, meta: artifactInfo(rec.data, root).meta }
+      refreshIssues()
+      emit({ kind: 'artifact', id, record: state.artifacts[id]! })
+      emit({ kind: 'issues', issues: state.issues })
+    }
+    return state.artifacts[id]!
+  }
+
+  function checkBase<T>(current: Rev<T>, id: string, baseRev: unknown) {
+    if (typeof baseRev !== 'string' || !baseRev) throw new HttpError(400, 'baseRev is required: send the rev of the version you edited')
+    if (current.rev !== baseRev) throw new HttpError(409, `${id} changed on disk since you opened it`, { current })
+  }
+
+  function commitItem(item: Item, create: boolean): Rev<Item> {
+    const rec = writeItem(item, root, { create })
+    state.items[item.id] = rec
+    journal.item(rec, 'board')
+    refreshIssues()
+    emit({ kind: 'item', id: item.id, record: rec })
+    emit({ kind: 'issues', issues: state.issues })
+    return rec
+  }
+  function commitQuestion(q: Question, create: boolean): Rev<Question> {
+    const rec = writeQuestion(q, root, { create })
+    state.questions[q.id] = rec
+    refreshIssues()
+    emit({ kind: 'question', id: q.id, record: rec })
+    emit({ kind: 'issues', issues: state.issues })
+    return rec
+  }
+
+  /** Create with the next free ID; if another writer takes it first, move on to the next. */
+  function create<T extends { id: string }>(taken: () => Set<string>, next: (taken: Set<string>) => T, commit: (rec: T) => Rev<T>): Rev<T> {
+    const claimed = taken()
+    for (let attempt = 0; attempt < MAX_CREATE_ATTEMPTS; attempt++) {
+      const rec = next(claimed)
+      try {
+        return commit(rec)
+      } catch (e) {
+        if (!(e instanceof FileExistsError)) throw e
+        claimed.add(rec.id)
+      }
+    }
+    throw new HttpError(503, 'could not find a free ID; the requirements folder is changing too fast, try again')
+  }
+
+  function refuseCrossSite(req: ApiRequest) {
+    if (req.method === 'GET') return
+    const h = req.headers ?? {}
+    if (!(h['content-type'] ?? '').startsWith('application/json')) throw new HttpError(415, 'writes must be sent as application/json')
+    const origin = h.origin
+    if (origin && h.host && origin !== `http://${h.host}` && origin !== `https://${h.host}`) {
+      throw new HttpError(403, `writes from ${origin} are not allowed`)
+    }
+  }
+
+  function handle(req: ApiRequest): unknown {
+    if (req.method === 'GET') return route(req)
+    // A write changes files on disk: comparisons with them are stale, now and once it is done.
+    diffs.touched()
+    const out = route(req)
+    return out instanceof Promise ? out.finally(() => diffs.touched()) : out
+  }
+
+  const refError = (e: unknown) => {
+    throw e instanceof DiffRefError ? new HttpError(400, e.message) : e
+  }
+
+  function route(req: ApiRequest): unknown {
+    const { method, path } = req
+    const body = (req.body ?? {}) as Record<string, unknown>
+    refuseCrossSite(req)
+
+    if (path === '/api/catalogue' && method === 'GET') {
+      return { items: state.items, questions: state.questions, artifacts: state.artifacts, layout: state.layout, config: state.config, issues: state.issues }
+    }
+
+    // Diff review: read-only git, in child processes like the history routes.
+    if (path === '/api/diff/commits' && method === 'GET') return diffs.commits()
+    if (path === '/api/diff/count' && method === 'GET') return diffs.count(req.query?.from || undefined, req.query?.to || undefined).catch(refError)
+    if (path === '/api/diff/auto' && method === 'GET') return diffs.auto().catch(refError)
+    if (path === '/api/diff' && method === 'GET') {
+      const q = req.query ?? {}
+      if (!q.from || !q.to) throw new HttpError(400, 'from and to are required')
+      return diffs.diff(q.from, q.to).catch(refError)
+    }
+
+    const a = /^\/api\/artifacts\/([^/]+)\/history$/.exec(path)
+    if (a && method === 'GET') {
+      const id = decodeURIComponent(a[1]!)
+      const rec = state.artifacts[id]
+      if (!rec) throw new HttpError(404, `${id} does not exist`)
+      const file = rec.data.file ? artifactPath(rec.data.file, root) : null
+      return Promise.all([
+        gitHistory(artifactSidecarPath(id, root), parseArtifact).catch(() => ({ versions: [], dirty: false, working: null })),
+        file ? gitAsset(file).catch(() => null) : Promise.resolve(null),
+      ]).then(([git, asset]) => ({ entries: buildArtifactTimeline(git, asset) }))
+    }
+
+    const ap = /^\/api\/artifacts\/([^/]+)$/.exec(path)
+    if (ap && method === 'PUT') {
+      // Only an artifact's details: whatever else the record carries, its file, regions and source stay as on disk.
+      const id = decodeURIComponent(ap[1]!)
+      const current = artifactOnDisk(id)
+      checkBase(current, id, body.baseRev)
+      const sent = (body.record ?? {}) as Record<string, unknown>
+      if (sent.id !== undefined && sent.id !== id) throw new HttpError(400, 'the record id does not match the URL')
+      const next = withArtifactDetails(current.data, sent)
+      const problems = artifactRoundTripProblems(next)
+      if (problems.length) throw new HttpError(422, `${id}: ${problems.join('; ')}`)
+      guard(itemList(), questionList(), { ...state.artifacts, [id]: { data: next, rev: '' } })
+      const rec = writeArtifact(next, root)
+      state.artifacts[id] = rec
+      refreshIssues()
+      emit({ kind: 'artifact', id, record: rec })
+      emit({ kind: 'issues', issues: state.issues })
+      return rec
+    }
+
+    let m = /^\/api\/items\/([^/]+)\/history$/.exec(path)
+    if (m && method === 'GET') {
+      const id = decodeURIComponent(m[1]!)
+      if (!state.items[id]) throw new HttpError(404, `${id} does not exist`)
+      // The one asynchronous route: git runs in child processes, off the request path of every other call.
+      return Promise.all([
+        gitHistory(itemPath(id, root)).catch(() => ({ versions: [], dirty: false, working: null })),
+        gitDirty(layoutPath(root)),
+        gitShots(root, id).catch(() => ({ commits: [], dirty: false })),
+      ]).then(([git, layoutDirty, shots]) => {
+        // Versions from before a status recode store the old value: compare as today's codes, so a relabel is no change.
+        const recodes = readRecodes(root)
+        const now = (it: Item): Item => ({ ...it, status: normaliseStatus(recodes, 'item', it.status) })
+        const diff = (a: Item, b: Item) => diffItems(now(a), now(b))
+        return { entries: buildTimeline(journal.read(id), { ...git, layoutDirty, screenshots: shots.commits, screenshotsDirty: shots.dirty }, diff) }
+      })
+    }
+
+    m = /^\/api\/items\/([^/]+)$/.exec(path)
+    if (m && method === 'PUT') {
+      const id = decodeURIComponent(m[1]!)
+      const item = prepareItem(body.record)
+      if (item.id !== id) throw new HttpError(400, 'the record id does not match the URL')
+      const current = itemOnDisk(id)
+      checkBase(current, id, body.baseRev)
+      if (current.data.type !== item.type) throw new HttpError(422, `${id}: the type of an item cannot change`)
+      guard([...itemList().filter((i) => i.id !== id), item], questionList())
+      return commitItem(item, false)
+    }
+
+    if (m && method === 'DELETE') {
+      const id = decodeURIComponent(m[1]!)
+      // The plan rewrites records across the catalogue, so plan it from the folder as it is right now.
+      syncFromDisk()
+      checkBase(itemOnDisk(id), id, body.baseRev)
+      const plan = planDelete(itemList(), questionList(), id)
+      const doomed = plan.doomed.map((i) => i.id)
+      const shown = Array.isArray(body.ids) ? [...(body.ids as unknown[])].map(String).sort() : null
+      if (!shown) throw new HttpError(400, 'ids is required: send the items you are deleting, the item and everything under it')
+      if (JSON.stringify(shown) !== JSON.stringify([...doomed].sort())) {
+        throw new HttpError(409, `what sits under ${id} changed since you asked; look again before deleting`)
+      }
+      const rewrites = new Map(plan.items.map((it) => [it.id, prepareItem(it)]))
+      const qRewrites = new Map(plan.questions.map((q) => [q.id, prepareQuestion(q)]))
+      guard(
+        [...itemList().filter((i) => !doomed.includes(i.id) && !rewrites.has(i.id)), ...rewrites.values()],
+        [...questionList().filter((q) => !qRewrites.has(q.id)), ...qRewrites.values()],
+      )
+
+      // References first, then the files: a failure part way leaves dangling links at worst, never a lost record.
+      const records = [...rewrites.values()].map((item) => commitItem(item, false))
+      const questions = [...qRewrites.values()].map((q) => commitQuestion(q, false))
+      const keptImages = new Set(itemList().filter((i) => !doomed.includes(i.id)).flatMap((i) => i.images.map((img) => img.src.split('/')[1])))
+      for (const x of doomed) {
+        deleteItemFile(x, root)
+        if (!keptImages.has(x)) deleteItemAssets(x, root)
+        delete state.items[x]
+        journal.forget(x)
+        emit({ kind: 'item', id: x, record: null })
+      }
+      const onDisk = readLayout(root)
+      if (!onDisk.error && doomed.some((x) => onDisk.layout.positions[x])) {
+        const positions = { ...onDisk.layout.positions }
+        for (const x of doomed) delete positions[x]
+        state.layout = { ...onDisk.layout, positions }
+        writeLayout(state.layout, root)
+        emit({ kind: 'layout', layout: state.layout })
+      }
+      refreshIssues()
+      emit({ kind: 'issues', issues: state.issues })
+      return { deleted: doomed, records, questions }
+    }
+
+    if (path === '/api/items/batch' && method === 'POST') {
+      // Check every record first, then write them all: a move never lands half done.
+      const changes = Array.isArray(body.changes) ? (body.changes as Record<string, unknown>[]) : null
+      if (!changes) throw new HttpError(400, 'changes must be a list of { id, baseRev, patch }')
+      const next = new Map<string, Item>()
+      for (const c of changes) {
+        const id = typeof c?.id === 'string' ? c.id : ''
+        if (!id) throw new HttpError(400, 'every change needs an id')
+        if (next.has(id)) throw new HttpError(400, `${id} appears twice in one batch`)
+        const current = itemOnDisk(id)
+        checkBase(current, id, c.baseRev)
+        const patch = (c.patch ?? {}) as Record<string, unknown>
+        const item = prepareItem({ ...current.data, ...patch, id })
+        if (item.type !== current.data.type) throw new HttpError(422, `${id}: the type of an item cannot change`)
+        next.set(id, item)
+      }
+      if (!next.size) return { records: [] }
+      guard([...itemList().filter((i) => !next.has(i.id)), ...next.values()], questionList())
+      return { records: [...next.values()].map((item) => commitItem(item, false)) }
+    }
+
+    if (path === '/api/items' && method === 'POST') {
+      const type = body.type as ItemType
+      if (!ITEM_TYPES.includes(type)) throw new HttpError(422, `type must be one of ${ITEM_TYPES.join(', ')}`)
+      const parentId = typeof body.parent === 'string' && body.parent ? body.parent : null
+      const parent = parentId ? (state.items[parentId]?.data ?? null) : null
+      if (parentId && !parent) throw new HttpError(422, `parent ${parentId} does not exist`)
+      const siblings = itemList().filter((i) => i.parent === (parent?.id ?? null)).sort(compareSiblings)
+      return create<Item>(
+        () => new Set([...takenIds(storiesDir(root)), ...Object.keys(state.items)]),
+        (taken) => {
+          let id: string
+          try {
+            id = nextItemId(taken, type, parent)
+          } catch (e) {
+            throw new HttpError(422, (e as Error).message)
+          }
+          const item = prepareItem({
+            status: defaultStatus(state.config, 'item'),
+            components: parent?.components ?? [],
+            ...body,
+            id,
+            type,
+            parent: parent?.id ?? null,
+            title: String(body.title ?? '').trim() || 'Untitled',
+            order: (siblings.at(-1)?.order ?? 0) + 1,
+            images: [],
+            extra: {},
+          })
+          guard([...itemList(), item], questionList())
+          return item
+        },
+        (item) => commitItem(item, true),
+      )
+    }
+
+    m = /^\/api\/questions\/([^/]+)$/.exec(path)
+    if (m && method === 'PUT') {
+      const id = decodeURIComponent(m[1]!)
+      const q = prepareQuestion(body.record)
+      if (q.id !== id) throw new HttpError(400, 'the record id does not match the URL')
+      checkBase(questionOnDisk(id), id, body.baseRev)
+      guard(itemList(), [...questionList().filter((x) => x.id !== id), q])
+      return commitQuestion(q, false)
+    }
+    if (m && method === 'DELETE') {
+      const id = decodeURIComponent(m[1]!)
+      checkBase(questionOnDisk(id), id, body.baseRev)
+      deleteQuestionFile(id, root)
+      delete state.questions[id]
+      refreshIssues()
+      emit({ kind: 'question', id, record: null })
+      emit({ kind: 'issues', issues: state.issues })
+      return { id }
+    }
+
+    if (path === '/api/questions' && method === 'POST') {
+      return create<Question>(
+        () => new Set([...takenIds(questionsDir(root)), ...Object.keys(state.questions)]),
+        (taken) => {
+          const q = prepareQuestion({
+            status: defaultStatus(state.config, 'question'),
+            ...body,
+            id: nextQuestionId(taken),
+            title: String(body.title ?? '').trim() || 'Untitled question',
+            answer: '',
+            extra: {},
+          })
+          guard(itemList(), [...questionList(), q])
+          return q
+        },
+        (q) => commitQuestion(q, true),
+      )
+    }
+
+    // How requirements are written (VOICE.md): read and edited on the Settings page, and by agents as a file.
+    if (path === '/api/voice' && method === 'GET') return readVoice()
+    if (path === '/api/voice' && method === 'PUT') {
+      const current = readVoice()
+      // Saved over what was shown only: an agent may have rewritten the file since.
+      if ((body.baseRev ?? null) !== current.rev) throw new HttpError(409, 'VOICE.md changed on disk since you opened it', { current: { data: current.text, rev: current.rev } })
+      if (typeof body.text !== 'string') throw new HttpError(400, 'text must be a string')
+      const text = body.text.endsWith('\n') ? body.text : `${body.text}\n`
+      writeAtomic(join(root, 'VOICE.md'), text)
+      return { text, rev: revOf(text) }
+    }
+
+    if (path === '/api/config' && method === 'PUT') {
+      // Patch the file as it is on disk now: only the fields sent change, every other setting stays as written.
+      let raw: Record<string, unknown> = {}
+      try {
+        raw = JSON.parse(readFileSync(configPath(root), 'utf8')) as Record<string, unknown>
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw new HttpError(422, 'board.config.json cannot be read; fix it on disk first')
+      }
+      const next = { ...raw }
+      const problems: string[] = []
+      const fields: [string, StatusKind, { status: string }[]][] = [
+        ['statuses', 'item', itemList()],
+        ['questionStatuses', 'question', questionList()],
+      ]
+      for (const [field, kind, records] of fields) {
+        if (body[field] === undefined) continue
+        const { list, problems: bad } = readStatusList(body[field], kind, field)
+        problems.push(...bad)
+        // A status still on a card can't go: its files would name a status the board no longer knows.
+        const kept = new Set(list.map((d) => d.code))
+        const dropped = new Map<string, number>()
+        for (const r of records) if (!kept.has(r.status)) dropped.set(r.status, (dropped.get(r.status) ?? 0) + 1)
+        for (const [code, n] of dropped) {
+          const was = (kind === 'item' ? state.config.statuses : state.config.questionStatuses).some((d) => d.code === code)
+          if (was) problems.push(`${field}: ${statusLabel(state.config, kind, code)} is still used by ${n} ${kind === 'item' ? 'item' : 'question'}${n === 1 ? '' : 's'}`)
+        }
+        next[field] = list.map(clean)
+      }
+      if (body.project !== undefined) {
+        const v = body.project as Record<string, unknown> | null
+        const name = typeof v?.name === 'string' ? v.name.trim() : ''
+        const accent = typeof v?.accent === 'string' ? v.accent.trim().toLowerCase() : ''
+        if (accent && !ACCENT_PATTERN.test(accent)) problems.push(`project: the accent must be a colour like #2f5dbe, not ${accent}`)
+        // The board's name and the locale are fixed now; a file that still names them is tidied on save.
+        const was: Record<string, unknown> = { ...((raw.project ?? {}) as Record<string, unknown>) }
+        delete was.locale
+        delete was.accent
+        next.project = { ...was, name, ...(accent ? { accent } : {}) }
+        delete next.board
+      }
+      if (body.components !== undefined) {
+        const { config: parsed, problems: bad } = parseConfig(JSON.stringify({ components: body.components }))
+        problems.push(...bad)
+        // A component still on a card can't go: its files would name an area the board no longer knows.
+        const kept = new Set(parsed.components.map((c) => c.name))
+        const dropped = new Map<string, number>()
+        for (const it of [...itemList(), ...Object.values(state.artifacts).map((r) => r.data)]) for (const c of it.components) if (!kept.has(c)) dropped.set(c, (dropped.get(c) ?? 0) + 1)
+        for (const [name, n] of dropped)
+          if (state.config.components.some((c) => c.name === name)) problems.push(`components: ${name} is still used by ${n} card${n === 1 ? '' : 's'} or artifact${n === 1 ? '' : 's'}`)
+        next.components = parsed.components
+      }
+      if (problems.length) throw new HttpError(422, problems.join('\n'))
+      writeAtomic(configPath(root), formatJson(next))
+      const read = readConfig(root)
+      state.config = read.config
+      state.parseIssues = [...state.parseIssues.filter((i) => i.id !== 'config'), ...read.problems.map((message) => ({ severity: 'error' as const, id: 'config', message }))]
+      refreshIssues()
+      emit({ kind: 'config', config: state.config })
+      emit({ kind: 'issues', issues: state.issues })
+      return state.config
+    }
+
+    if (path === '/api/layout' && method === 'PUT') {
+      // Patch what is on disk now, not what we last synced: a git pull may have rewritten it a moment ago.
+      const onDisk = readLayout(root)
+      if (onDisk.error) throw new HttpError(422, 'board-layout.json cannot be read; fix or delete it before moving cards')
+      const patch = (body.positions ?? {}) as Record<string, { x: number; y: number } | null>
+      const positions = { ...onDisk.layout.positions }
+      for (const [id, p] of Object.entries(patch)) {
+        if (p === null) delete positions[id]
+        else if (Number.isFinite(p?.x) && Number.isFinite(p?.y)) positions[id] = { x: Math.round(p.x), y: Math.round(p.y) }
+      }
+      const moved = Object.keys(patch).filter((id) => state.items[id])
+      if (body.lanes !== undefined && !Array.isArray(body.lanes)) throw new HttpError(422, 'lanes must be a list of names')
+      const lanes = body.lanes !== undefined ? (body.lanes as string[]) : onDisk.layout.lanes
+      let firstLane = onDisk.layout.firstLane
+      if (body.firstLane !== undefined) {
+        if (body.firstLane !== null && typeof body.firstLane !== 'string') throw new HttpError(422, 'firstLane must be a name or null')
+        firstLane = typeof body.firstLane === 'string' && body.firstLane !== UNASSIGNED_LANE ? body.firstLane : undefined
+      }
+      const problem = laneListProblem([firstLaneName({ firstLane }), ...lanes])
+      if (problem) throw new HttpError(422, problem)
+      const lanesChanged = JSON.stringify(lanes) !== JSON.stringify(state.layout.lanes)
+      state.layout = { positions, lanes } as Layout
+      if (firstLane) state.layout.firstLane = firstLane
+      state.layoutReadable = true
+      writeLayout(state.layout, root)
+      for (const id of moved) journal.position(id, onDisk.layout.positions[id] ?? null, positions[id] ?? null, 'board')
+      emit({ kind: 'layout', layout: state.layout })
+      if (lanesChanged) {
+        refreshIssues() // lane names feed the swimlane check
+        emit({ kind: 'issues', issues: state.issues })
+      }
+      return state.layout
+    }
+
+    throw new HttpError(404, `no route for ${method} ${path}`)
+  }
+
+  /** Re-read the folder and emit an event for every record whose file changed. */
+  function syncFromDisk() {
+    diffs.touched()
+    // Screenshot files carry no rev in the catalogue: the journal fingerprints them itself.
+    journal.screenshots(join(root, 'assets'))
+    const prev = state
+    const next = loadCatalogue(root)
+    const events: CatalogueEvent[] = []
+    for (const id of new Set([...Object.keys(prev.items), ...Object.keys(next.items)])) {
+      if (prev.items[id]?.rev !== next.items[id]?.rev) {
+        events.push({ kind: 'item', id, record: next.items[id] ?? null })
+        if (next.items[id]) journal.item(next.items[id]!, 'disk')
+      }
+    }
+    for (const id of new Set([...Object.keys(prev.questions), ...Object.keys(next.questions)])) {
+      if (prev.questions[id]?.rev !== next.questions[id]?.rev) events.push({ kind: 'question', id, record: next.questions[id] ?? null })
+    }
+    for (const id of new Set([...Object.keys(prev.artifacts), ...Object.keys(next.artifacts)])) {
+      const was = prev.artifacts[id]
+      const now = next.artifacts[id]
+      if (was?.rev !== now?.rev || JSON.stringify(was?.meta) !== JSON.stringify(now?.meta)) events.push({ kind: 'artifact', id, record: now ?? null })
+    }
+    if (JSON.stringify(prev.layout) !== JSON.stringify(next.layout)) {
+      events.push({ kind: 'layout', layout: next.layout })
+      for (const id of new Set([...Object.keys(prev.layout.positions), ...Object.keys(next.layout.positions)])) {
+        if (next.items[id]) journal.position(id, prev.layout.positions[id] ?? null, next.layout.positions[id] ?? null, 'disk')
+      }
+    }
+    if (JSON.stringify(prev.config) !== JSON.stringify(next.config)) events.push({ kind: 'config', config: next.config })
+    const issuesChanged = JSON.stringify(prev.issues) !== JSON.stringify(next.issues)
+    state = next
+    if (!events.length && !issuesChanged) return
+    events.push({ kind: 'issues', issues: next.issues })
+    for (const e of events) emit(e)
+  }
+
+  return {
+    handle,
+    syncFromDisk,
+    getState: () => state,
+    /** A file in the folder, or an artifact's file elsewhere, changed on disk (see `ApiOptions.watched`). */
+    worktreeChanged: () => diffs.touched(),
+    /** Start reading the Diff review's commit list in the background (see `DiffReader.warm`). */
+    warmDiff: () => diffs.warm(),
+  }
+}
+
+export type CatalogueApi = ReturnType<typeof createCatalogueApi>
+
+/** A status as the config file holds it: its code a bare number, no empty fields. */
+function clean(d: StatusDef): Record<string, unknown> {
+  const out: Record<string, unknown> = { code: Number(d.code), label: d.label }
+  if (d.heading) out.heading = d.heading
+  out.help = d.help
+  out.tone = d.tone
+  if (d.role) out.role = d.role
+  if (d.settle) out.settle = true
+  return out
+}

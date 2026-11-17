@@ -1,0 +1,9 @@
+node_modules
+dist
+/test-results/
+/playwright-report/
+/shots/
+/.history/
+/.links/
+/requirements/exports/
+__pycache__/

@@ -1,0 +1,326 @@
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterAll, describe, expect, it } from 'vitest'
+import { checkCatalogue, hasErrors } from '../shared/check.ts'
+import { depthFirst, parseCsv, questionsCsv, requirementsCsv } from '../shared/csv.ts'
+import { itemRoundTripProblems, parseItem, parseQuestion, serialiseItem, serialiseQuestion } from '../shared/files.ts'
+import { nextItemId, nextQuestionId } from '../shared/ids.ts'
+import type { Item, Question } from '../shared/types.ts'
+import { DEFAULT_CONFIG, parseConfig } from '../shared/config.ts'
+import { FIXTURE_CONFIG } from './fixtures.ts'
+import { storiesDir, loadCatalogue, questionsDir, serialiseLayout, writeItem } from '../server/catalogueFs.ts'
+
+const item = (over: Partial<Item>): Item => ({
+  id: 'US-01.1.1',
+  type: 'story',
+  parent: 'FT-01.1',
+  title: 'A story',
+  status: '1',
+  components: ['Core'],
+  sources: [],
+  order: 1,
+  swimlane: null,
+  related: [],
+  artifacts: [],
+  images: [],
+  description: '',
+  acceptance: '',
+  technical: '',
+  notes: '',
+  extra: {},
+  ...over,
+})
+const epic = item({ id: 'EP-01', type: 'epic', parent: null })
+const feature = item({ id: 'FT-01.1', type: 'feature', parent: 'EP-01' })
+const question = (over: Partial<Question>): Question => ({
+  id: 'OQ-01', kind: 'question', title: 'Q', status: '1', owner: 'Client', affects: ['US-01.1.1'], sources: [], question: 'Why?', answer: '', extra: {}, ...over,
+})
+
+/** The project's own catalogue, if this copy of the board has one yet (a fresh install may not). */
+const hasLive = existsSync(storiesDir())
+
+describe('catalogue files', () => {
+  const real = loadCatalogue()
+
+  // The tests that read live content: the committed catalogue must stay valid and round-trip.
+  it.skipIf(!hasLive)('loads the real catalogue with no errors', () => {
+    expect(Object.keys(real.items).length).toBeGreaterThan(0)
+    expect(real.issues.filter((i) => i.severity === 'error')).toEqual([])
+  })
+
+  it.skipIf(!hasLive)('round-trips every item file byte for byte', () => {
+    for (const f of readdirSync(storiesDir())) {
+      const text = readFileSync(join(storiesDir(), f), 'utf8')
+      expect(serialiseItem(parseItem(text)), f).toBe(text)
+    }
+  })
+
+  it.skipIf(!existsSync(questionsDir()))('round-trips every question file byte for byte', () => {
+    for (const f of readdirSync(questionsDir())) {
+      const text = readFileSync(join(questionsDir(), f), 'utf8')
+      expect(serialiseQuestion(parseQuestion(text)), f).toBe(text)
+    }
+  })
+
+  it('keeps unknown frontmatter keys, notes, answers and awkward strings', () => {
+    const it1 = item({
+      title: 'Colon: "quotes" # and hash',
+      sources: ['RFP: Schedule Management', 'Q&A 2026-09-24 #7'],
+      description: 'Line one.\n\nLine two with *markdown*.',
+      notes: 'A note.',
+      images: [{ src: 'assets/US-01.1.1/a.png', viewport: 'mobile', caption: 'Home' }],
+      extra: { owner: 'Sam', tags: ['x'] },
+    })
+    expect(parseItem(serialiseItem(it1))).toEqual(it1)
+    const q = question({ answer: 'Yes, always.' })
+    expect(parseQuestion(serialiseQuestion(q))).toEqual(q)
+  })
+
+  it('round-trips an image app byte for byte, in src, viewport, app, caption order', () => {
+    const it1 = item({ images: [{ src: 'assets/US-01.1.1/mobile-home.png', viewport: 'mobile', app: 'mobile', caption: 'Home' }] })
+    const text = serialiseItem(it1)
+    expect(text).toContain('  - src: assets/US-01.1.1/mobile-home.png\n    viewport: mobile\n    app: mobile\n    caption: Home\n')
+    expect(parseItem(text)).toEqual(it1)
+    expect(serialiseItem(parseItem(text))).toBe(text)
+  })
+
+  it('flags an unknown image app and a phone-app shot with a desktop viewport', () => {
+    const bad = parseItem(serialiseItem(item({ images: [{ src: 'assets/US-01.1.1/a.png', viewport: 'desktop', app: 'tablet' }] })))
+    const odd = item({ images: [{ src: 'assets/US-01.1.1/a.png', viewport: 'desktop', app: 'phone' }] })
+    const msgs = (i: typeof bad, config = FIXTURE_CONFIG) => checkCatalogue({ items: [epic, feature, i], questions: [], config }).map((x) => x.message)
+    expect(msgs(bad)).toContain('image app "tablet" is not one of web, phone')
+    expect(msgs(odd)).toContain('image assets/US-01.1.1/a.png is from the Phone app, a mobile app, but its viewport is desktop')
+    // With no screenshot apps configured, any app is accepted.
+    expect(msgs(bad, DEFAULT_CONFIG).filter((m) => m.includes('image app'))).toEqual([])
+  })
+
+  it('round-trips all four body sections, written in a fixed order', () => {
+    const it1 = item({
+      description: 'As a user, I book, so that I work.',
+      acceptance: '- Given a list, when I book, then it saves.\n- Another.',
+      technical: 'Uses the scheduling engine.',
+      notes: 'A note.',
+    })
+    const text = serialiseItem(it1)
+    const body = text.slice(text.indexOf('\n---\n') + 5)
+    expect(body).toBe(
+      '\nAs a user, I book, so that I work.\n\n## Acceptance criteria\n\n- Given a list, when I book, then it saves.\n- Another.\n\n## Technical discussion\n\nUses the scheduling engine.\n\n## Notes\n\nA note.\n',
+    )
+    expect(parseItem(text)).toEqual(it1)
+    expect(serialiseItem(parseItem(text))).toBe(text)
+  })
+
+  it('writes only the sections that have text', () => {
+    const it1 = item({ description: 'D.', technical: 'T.' })
+    const text = serialiseItem(it1)
+    expect(text).not.toContain('## Acceptance criteria')
+    expect(text).not.toContain('## Notes')
+    expect(serialiseItem(parseItem(text))).toBe(text)
+  })
+
+  it('reads sections written out of order by hand', () => {
+    const head = serialiseItem(item({}))
+    const got = parseItem(head + '\nDesc.\n\n## Notes\n\nN.\n\n## Technical discussion\n\nT.\n\n## Acceptance criteria\n\nA.\n')
+    expect([got.description, got.acceptance, got.technical, got.notes]).toEqual(['Desc.', 'A.', 'T.', 'N.'])
+  })
+
+  it('flags any section that holds another section\'s heading', () => {
+    expect(itemRoundTripProblems(item({ description: 'x\n## Technical discussion\ny' }))[0]).toMatch(/description cannot contain a "## Technical discussion"/)
+    expect(itemRoundTripProblems(item({ notes: '## Acceptance criteria' }))[0]).toMatch(/Notes cannot contain a "## Acceptance criteria"/)
+    expect(itemRoundTripProblems(item({ acceptance: '- a', technical: 't', notes: 'n' }))).toEqual([])
+  })
+
+  it('keeps a leading indent (a code block) through a round trip', () => {
+    const it1 = item({ description: '    code line\nmore', notes: '    indented note' })
+    expect(parseItem(serialiseItem(it1))).toEqual(it1)
+  })
+
+  it('flags a mistyped image viewport instead of silently making it desktop', () => {
+    const it1 = parseItem(serialiseItem(item({ images: [{ src: 'assets/US-01.1.1/a.png', viewport: 'moblie' as never }] })))
+    expect(it1.images[0]!.viewport).toBe('moblie')
+    expect(checkCatalogue({ items: [epic, feature, it1], questions: [] }).map((i) => i.message)).toContain('image viewport "moblie" is not desktop or mobile')
+  })
+
+  it.skipIf(!hasLive)('exports CSV in the old shape and reads it back', () => {
+    const items = Object.values(real.items).map((r) => r.data)
+    const rows = parseCsv(requirementsCsv(items))
+    expect(rows).toHaveLength(items.length)
+    expect(rows[0]!.ID).toBe(depthFirst(items)[0]!.id)
+    const one = parseCsv(requirementsCsv([item({ acceptance: '- A, "quoted"\n- B', technical: 'See [the rule](US-01.1.2).', related: ['US-01.1.2', 'US-01.1.3'] })]))[0]!
+    expect(Object.keys(one).slice(-3)).toEqual(['Acceptance criteria', 'Technical discussion', 'Related'])
+    expect([one['Acceptance criteria'], one['Technical discussion'], one.Related]).toEqual(['- A, "quoted"\n- B', 'See the rule.', 'US-01.1.2; US-01.1.3'])
+    const qs = parseCsv(questionsCsv(Object.values(real.questions).map((r) => r.data)))
+    expect(qs.map((q) => q.ID ?? '')).toEqual([...qs.map((q) => q.ID ?? '')].sort((a, b) => a.localeCompare(b, 'en', { numeric: true })))
+  })
+
+  it('round-trips related after swimlane, and writes nothing when there are none', () => {
+    expect(serialiseItem(item({}))).not.toContain('related:')
+    const text = serialiseItem(item({ swimlane: 'MVP', related: ['US-01.1.2', 'FT-02.1'] }))
+    expect(text).toContain('swimlane: MVP\nrelated:\n  - US-01.1.2\n  - FT-02.1\nimages: []')
+    expect(parseItem(text).related).toEqual(['US-01.1.2', 'FT-02.1'])
+  })
+
+  it('checks related items and links in the text', () => {
+    const story = (id: string, over: Partial<Item> = {}) => item({ id, sources: ['S'], ...over })
+    const messages = (items: Item[], questions: Question[] = []) =>
+      checkCatalogue({ items: [epic, feature, ...items], questions }).map((i) => `${i.severity} ${i.id} ${i.message}`)
+    const retired = story('US-01.1.9', { status: '5' })
+    const q = { id: 'OQ-01', kind: 'question', title: 'Q', affects: ['US-01.1.1'], owner: '', status: '1', sources: [], question: 'See [the story](US-01.1.1).', answer: '', extra: {} } as Question
+
+    const ok = messages([story('US-01.1.1', { related: ['US-01.1.2'], description: 'Uses [the other](US-01.1.2), see OQ-01 and `US-09.9.9`.' }), story('US-01.1.2')], [q])
+    expect(ok.filter((m) => m.includes('related') || m.includes('the text'))).toEqual([])
+
+    const bad = messages(
+      [
+        story('US-01.1.1', { related: ['US-01.1.1', 'US-09.9.9', 'OQ-01', 'US-01.1.2', 'US-01.1.2', 'US-01.1.9'], notes: '[gone](US-09.9.9), [old](US-01.1.9), OQ-77, [q](OQ-78), US-08.8.8, merges the former US-01.1.9.' }),
+        story('US-01.1.2', { related: ['US-01.1.1'] }),
+        retired,
+      ],
+      [q],
+    )
+    expect(bad).toEqual(
+      expect.arrayContaining([
+        'error US-01.1.1 related lists the item itself',
+        'error US-01.1.1 related lists US-09.9.9, which does not exist',
+        'error US-01.1.1 related lists OQ-01, an outstanding item; list the item under its affects instead',
+        'warning US-01.1.1 related lists US-01.1.2 twice',
+        'warning US-01.1.1 related lists US-01.1.9, which is retired',
+        'warning US-01.1.2 related lists US-01.1.1, which already lists this item; keep it on one side',
+        'error US-01.1.1 the text links to US-09.9.9, which does not exist',
+        'warning US-01.1.1 the text links to US-01.1.9, which is retired',
+        'warning US-01.1.1 the text mentions OQ-77, which does not exist',
+        'warning US-01.1.1 the text links to OQ-78, which does not exist',
+        'warning US-01.1.1 the text mentions US-08.8.8, which does not exist',
+      ]),
+    )
+    // A bare mention of a retired item is history, not a problem.
+    expect(bad.filter((m) => m.includes('mentions US-01.1.9'))).toEqual([])
+    // Deleting a question never adds an error: links to it only warn.
+    expect(hasErrors(checkCatalogue({ items: [epic, feature, story('US-01.1.1', { description: '[q](OQ-01)' })], questions: [] }))).toBe(false)
+  })
+
+  it('round-trips swimlane after order, and writes nothing for the unnamed lane', () => {
+    const plain = serialiseItem(item({}))
+    expect(plain).not.toContain('swimlane')
+    expect(serialiseItem(parseItem(plain))).toBe(plain)
+    const laned = item({ swimlane: 'Phase 2' })
+    const text = serialiseItem(laned)
+    expect(text).toContain('order: 1\nswimlane: Phase 2\nimages: []\n')
+    expect(parseItem(text)).toEqual(laned)
+    expect(serialiseItem(parseItem(text))).toBe(text)
+    expect(parseItem(text.replace('swimlane: Phase 2', 'swimlane: ""')).swimlane).toBeNull()
+  })
+
+  it('writes lanes after positions, one per line, only once there are any', () => {
+    expect(serialiseLayout({ positions: {}, lanes: ['MVP', 'Phase 2'] })).toBe('{\n  "positions": {},\n  "lanes": [\n    "MVP",\n    "Phase 2"\n  ]\n}\n')
+    expect(serialiseLayout({ positions: {}, lanes: [], firstLane: 'Backlog' })).toBe('{\n  "positions": {},\n  "firstLane": "Backlog"\n}\n')
+  })
+
+  it('writes layout one card per line with rounded, sorted positions', () => {
+    expect(serialiseLayout({ positions: { 'FT-01.10': { x: 1.4, y: 2.6 }, 'FT-01.9': { x: 0, y: 0 } }, lanes: [] })).toBe(
+      '{\n  "positions": {\n    "FT-01.9": {"x":0,"y":0},\n    "FT-01.10": {"x":1,"y":3}\n  }\n}\n',
+    )
+    expect(serialiseLayout({ positions: {}, lanes: [] })).toBe('{\n  "positions": {}\n}\n')
+  })
+})
+
+describe('check rules', () => {
+  const ok = [epic, feature, item({})]
+  it('warns about a swimlane on an epic or feature, and one that names no lane', () => {
+    const msgs = (items: Item[], lanes?: string[]) => checkCatalogue({ items, questions: [], lanes }).filter((i) => i.severity === 'warning').map((i) => i.message)
+    expect(msgs([{ ...epic, swimlane: 'MVP' }, feature, item({})], ['MVP'])).toContain('swimlane "MVP" is set on an epic; only stories sit in lanes, so the board ignores it')
+    expect(msgs([epic, feature, item({ swimlane: 'Phase 9' })], ['MVP']).some((m) => m.startsWith('swimlane "Phase 9" is not a lane'))).toBe(true)
+    expect(msgs([epic, feature, item({ swimlane: 'MVP' })], ['MVP']).some((m) => m.includes('swimlane'))).toBe(false)
+    expect(msgs([epic, feature, item({ swimlane: 'Phase 9' })]).some((m) => m.includes('swimlane'))).toBe(false) // no lane list: not checked
+    expect(hasErrors(checkCatalogue({ items: [epic, feature, item({ swimlane: 'Phase 9' })], questions: [], lanes: [] }))).toBe(false)
+  })
+
+  it('warns once per voice rule on a live description, never on Notes or a retired card', () => {
+    const config = parseConfig(
+      JSON.stringify({
+        voice: {
+          descriptionWarnings: [
+            { pattern: '\\bour reading\\b', message: 'an "our reading" marker' },
+            { pattern: '^Update \\d{4}-\\d{2}-\\d{2}', flags: 'im', message: 'an update paragraph' },
+          ],
+        },
+      }),
+    ).config
+    const voice = (items: Item[]) =>
+      checkCatalogue({ items: [epic, feature, ...items], questions: [], config })
+        .filter((i) => i.message.startsWith('description has'))
+        .map((i) => `${i.severity} ${i.id} ${i.message}`)
+    expect(voice([item({ description: 'Books a slot (Our Reading, twice: our reading).\n\nUpdate 2026-11-05: changed.' })])).toEqual([
+      'warning US-01.1.1 description has an "our reading" marker ("Our Reading"): move provenance and history to Notes',
+      'warning US-01.1.1 description has an update paragraph ("Update 2026-11-05"): move provenance and history to Notes',
+    ])
+    expect(voice([item({ description: 'Books a slot.', notes: 'Our reading of the RFP.\n\nUpdate 2026-11-05: changed.' })])).toEqual([])
+    expect(voice([item({ description: 'Books a slot (our reading).', status: '5' })])).toEqual([]) // retired
+    expect(voice([{ ...feature, description: 'Our reading.' }])).toEqual(['warning FT-01.1 description has an "our reading" marker ("Our reading"): move provenance and history to Notes'])
+    // No rules configured: nothing to check.
+    expect(checkCatalogue({ items: [epic, feature, item({ description: 'our reading' })], questions: [] }).some((i) => i.message.startsWith('description has'))).toBe(false)
+  })
+
+  it('trims a long match to about 40 characters', () => {
+    const config = parseConfig(JSON.stringify({ voice: { descriptionWarnings: [{ pattern: 'said .*', message: 'a remark' }] } })).config
+    const msg = checkCatalogue({ items: [epic, feature, item({ description: `He said ${'x'.repeat(80)}` })], questions: [], config }).find((i) => i.message.startsWith('description has'))!.message
+    expect(msg).toBe(`description has a remark ("said ${'x'.repeat(34)}…"): move provenance and history to Notes`)
+  })
+
+  it('passes a clean tree', () => {
+    expect(hasErrors(checkCatalogue({ items: ok, questions: [question({})] }))).toBe(false)
+  })
+  const msgs = (items: Item[], questions: Question[] = [], fileExists?: (p: string) => boolean) =>
+    checkCatalogue({ items, questions, fileExists }).filter((i) => i.severity === 'error').map((i) => i.message)
+  const cfgMsgs = (items: Item[]) => checkCatalogue({ items, questions: [], config: FIXTURE_CONFIG }).filter((i) => i.severity === 'error').map((i) => i.message)
+
+  it('flags duplicates, missing parents and wrong parent types', () => {
+    expect(msgs([...ok, item({})])).toContain('duplicate ID US-01.1.1')
+    expect(msgs([epic, item({ parent: 'FT-09.9' })])).toContain('parent FT-09.9 does not exist')
+    expect(msgs([epic, feature, item({ id: 'FT-01.2', type: 'feature', parent: 'FT-01.1' })])[0]).toMatch(/feature's parent must be an epic/)
+    expect(msgs([...ok, item({ id: 'US-01.1.2', parent: 'US-01.1.1' })])[0]).toMatch(/story's parent must be a feature or epic/)
+    expect(msgs([item({ id: 'EP-02', type: 'epic', parent: 'EP-01' }), epic])).toContain('an epic has no parent')
+  })
+  it('allows a story directly under an epic', () => {
+    expect(msgs([epic, item({ id: 'US-01.0.1', parent: 'EP-01' })])).toEqual([])
+  })
+  it('flags vocabulary, ID shape, bad affects and missing images', () => {
+    expect(msgs([epic, feature, item({ status: 'Maybe' as never })])[0]).toMatch(/status "Maybe"/)
+    expect(cfgMsgs([epic, feature, item({ components: ['Blockchain'] })])[0]).toMatch(/component "Blockchain"/)
+    expect(msgs([epic, feature, item({ components: ['Blockchain'] })])).toEqual([]) // no components configured: any is accepted
+    expect(msgs([epic, feature, item({ id: 'US-1.1' })])[0]).toMatch(/does not match/)
+    expect(msgs(ok, [question({ affects: ['US-99.1.1'] })])).toContain('affects US-99.1.1, which does not exist')
+    const withImg = item({ images: [{ src: 'assets/US-01.1.1/a.png', viewport: 'desktop' }] })
+    expect(msgs([epic, feature, withImg], [], () => false)).toContain('image file assets/US-01.1.1/a.png is missing')
+    expect(msgs([epic, feature, withImg], [], () => true)).toEqual([])
+  })
+})
+
+describe('next IDs', () => {
+  const items = [epic, feature, item({}), item({ id: 'US-01.1.9' }), item({ id: 'FT-01.3', type: 'feature', parent: 'EP-01' }), item({ id: 'EP-07', type: 'epic', parent: null })]
+  it('numbers under the parent', () => {
+    const taken = items.map((i) => i.id)
+    expect(nextItemId(taken, 'epic', null)).toBe('EP-08')
+    expect(nextItemId(taken, 'feature', epic)).toBe('FT-01.4')
+    expect(nextItemId(taken, 'story', feature)).toBe('US-01.1.10')
+    expect(nextItemId(taken, 'story', epic)).toBe('US-01.0.1')
+    expect(() => nextItemId(taken, 'feature', feature)).toThrow()
+  })
+  it('numbers questions', () => {
+    expect(nextQuestionId(['OQ-09', 'OQ-34'])).toBe('OQ-35')
+  })
+})
+
+describe('writing', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'catalogue-'))
+  afterAll(() => rmSync(dir, { recursive: true, force: true }))
+  it('writes atomically and reloads what it wrote', () => {
+    writeItem(epic, dir)
+    writeItem(feature, dir)
+    const rec = writeItem(item({ title: 'Written' }), dir)
+    const loaded = loadCatalogue(dir)
+    expect(loaded.items['US-01.1.1']).toEqual(rec)
+    expect(readdirSync(storiesDir(dir))).toEqual(['EP-01.md', 'FT-01.1.md', 'US-01.1.1.md'])
+  })
+})

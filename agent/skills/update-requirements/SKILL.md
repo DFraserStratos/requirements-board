@@ -1,0 +1,196 @@
+---
+name: update-requirements
+description: Record new evidence (meeting transcripts, notes, emails, typed decisions or features) as a catalogue note, fill in question answers the evidence settles, and update the requirements catalogue from the note and from question answers changed in the repo. Use after a client meeting, after answering questions on the Requirements Board, or when the user gives decisions or new features to record. Requirements only; any follow-on work (such as a build plan) is a separate skill, named under "This repo".
+argument-hint: "[attach or paste transcripts and notes] [optional: since <git ref>, default HEAD]"
+---
+
+# Update requirements from new notes and answered questions
+
+Turns new evidence and board answers into catalogue changes, every one of them traceable to a
+numbered point in a note or to a question's answer.
+
+Outputs:
+- the raw sources filed in `REQ/artifacts/files/`, and one reconciled note per session in `REQ/notes/`;
+- questions answered or completed in `REQ/questions/`;
+- requirement items edited, added, retired or moved in `REQ/stories/` (plus `REQ/domain-model.md`
+  where the model changed);
+- new questions for anything left unresolved;
+- a change log in `REQ/changes/`, which the follow-on skill (if any) reads next.
+
+## This repo
+
+The only repo-specific facts this skill uses. When the board moves to another repo, rewrite this
+block (the board's `ADOPTING.md` says how) and leave the rest alone.
+
+- `BOARD` = `requirements-board` (the board's folder); `REQ` = `requirements-board/requirements` (the
+  requirements folder: the catalogue, its notes, artifacts and change logs all live there). Paths
+  below are relative to the repo root.
+- Check: `npm --prefix requirements-board run check`.
+- Who signs requirements off: `<TODO: your client>`. Files store status numbers
+  (`status: 4`), which mean only what `REQ/board.config.json` says (`statuses`, `questionStatuses`):
+  look them up there, never infer one from its number. Starter items: 1 Proposed (default), 2 Open
+  (waiting), 3 Verify (settle), 4 Confirmed (settle; signed off by the client, never set without the
+  client's explicit sign-off), 5 Retired. Questions: 1 Open (default), 2 Confirm, 3 Proposed, 4 Answered.
+- Out of bounds for this skill: the app and its build plan, `<TODO: the app's folder and the build plan's folder>`.
+- Follow-on skill: `update-build-plan`, which reads the change log once the user has committed it.
+- Shape precedent for a note: none yet. The first note this skill writes sets it; then name it here.
+
+## Ground rules
+
+- Read `REQ/SCHEMA.md`, `REQ/VOICE.md` (how requirements are written) and `REQ/notes/README.md` first: they are binding (item format, sources,
+  statuses, the answering convention, IDs, no deletes). Then read the shape precedent named under
+  "This repo": it is the shape the note this skill writes follows.
+- The catalogue is the source of truth. This is requirements work only: do not read or change anything
+  "This repo" lists as out of bounds.
+- Never invent a requirement. Every change traces to a note point (`"Notes <date> · <slug> #n"`) or a
+  question answer. Anything the evidence leaves unresolved becomes a new question (OQ), not a guess.
+- Every source you write must resolve: the board opens it at the spot it cites, and the check
+  warns on one that resolves to nothing (SCHEMA's `sources` row lists the forms). Use
+  `"RFP p.<printed page> · <Section> › <subheading>"`, `"Notes <date> · <the note's title words> #n"`
+  (several points as `#2 #16`), `"Transcript <date> · <name> L27-33"` for transcript lines, a bare
+  `OQ-nn`. Check one with `npm --prefix BOARD run source -- "<source>"`.
+- Notes are append only: never edit an existing note, except the one this run creates.
+- Keep the user's own wording when quoting their answers and notes (fix spelling, drop filler).
+- **Requirements read as current, never as a decision log.** A story's description says what the
+  system does, for whom, and a short why, as if it had always worked this way (`REQ/VOICE.md`, "The
+  description", and its model story). History, who decided what, decision numbers, "our reading"
+  markers and meeting quotes go in Notes and `sources`, never the description. Stories hold the
+  requirements; epics and features give only the broad theme. Every subagent that writes or reviews
+  requirement text is told this in its brief and reads VOICE.md's model before writing: a file in a
+  reading list is not enough.
+- Do not commit or push.
+- You are the orchestrator: keep your own context for plumbing and decisions, and give the reading,
+  drafting and checking to subagents with fresh context. This skill authorises the Workflow tool (load
+  the `workflow-authoring` skill before writing the script). Opus for writing and editing, Sonnet for
+  extraction, an independent reviewer after every edit. For a small input (one short note, about five
+  questions or fewer) skip the workflow: do it inline, with one reviewer subagent.
+
+## Stage 0: inputs (do this yourself)
+
+1. **Evidence the user gave:** attached or pasted transcripts, meeting notes, emails, documents, and
+   typed context (decisions, text, new features). If the user gave nothing and the repo shows no
+   question changes, ask what to record.
+2. **Repo changes:** `git diff <ref> --name-status -- REQ`
+   and `git status --porcelain -- REQ` (for untracked files).
+   `<ref>` is HEAD unless the user names one. Board answers live in `REQ/questions/*.md`. The board may
+   also have changed the statuses of affected items: keep those changes. A file whose only change is a
+   status recoded per `REQ/status-recodes.json` is not a change: ignore it.
+3. **Inventory the questions** changed in that diff: ID, title, status, answer. Flag every answer that
+   defers to the evidence ("in the transcript", "see notes", "as discussed"), is partial, or is empty
+   while marked Answered (4).
+
+## Stage 1: file the evidence (yourself)
+
+- Raw transcripts go to `REQ/artifacts/files/<meeting name>.md`, with the raw wording, beside any
+  audio of the same name. Other raw material (emails, documents) goes in the same folder, unless it is
+  short enough to sit inside the note. Nothing the catalogue cites lives anywhere else in the repo.
+- Two or more transcripts of the same session (for example Teams and Voice Memos): run the
+  `transcript-reconciler` skill first, then file and register the reconciled transcript; the raws go
+  beside it. A meeting is recorded once, as one reconciled transcript per session: never digest two raw
+  transcripts of the same recording separately.
+- The note is `REQ/notes/YYYY-MM-DD-<slug>.md`: one per session, dated when the input happened, not
+  when it was filed. If that session's note already exists, append new points at its end, continuing the
+  numbering. Its sources cite it as `Notes <date> · <slug in words>` (the slug's words, any case), which
+  resolves by the file name alone, and each `#n` to its point: a numbered list item at the very start of
+  a line (`16. **Title.** ...`, continuation lines indented), numbered once across the whole note.
+  Keep that shape: a point written as a heading, a bold `**16.**`, or numbering that restarts per
+  section does not resolve.
+- Register each new transcript and each new note as an artifact, so the board can show it and items
+  can link to a spot in it (a heading, or a line range such as `#L27-33`): follow the `add-artifact`
+  skill (kind `transcript` or `note`; the file is already in `REQ/artifacts/files/` or `REQ/notes/`). Diagrams supplied as evidence are
+  artifacts too. A note needs nothing more to be citable. A transcript does: register it with
+  `--cited-as "Transcript <date> · <name>" --cited-as "Recording <date> · <name>"`, the names its
+  note uses, so `"Transcript <date> · <name> L27-33"` opens those lines.
+
+## Stage 2: extract (parallel, Sonnet)
+
+- Use one agent per transcript or large source, and one for the user's typed notes. Extract from the
+  reconciled transcript, not the raw ones, where one exists; cite its headings or line ranges
+  (`AR-nn#L120-140`).
+- Each returns structured points: summary, short quote, location in the source, and kind (decision,
+  rule, correction, new feature, number, doubt, or question answer). It also returns the OQ-nn and item
+  IDs each point touches, mapped by reading the catalogue.
+
+## Stage 3: the note and the answers
+
+- **Writer (Opus):** reconciles the extracts into the note, in the precedent's shape:
+  - a heading block (who, what was covered, the inputs gathered, with relative links to the raw files);
+  - "Questions answered" (the board answer quoted first, then what the evidence adds);
+  - "<user>'s notes", in their wording;
+  - "Other points".
+  Points are numbered once across the whole note. Where sources disagree, keep both and flag it.
+- **Answers:** for each flagged question, draft the answer from the note and cite the points (`See Notes
+  <date> · <slug> #n`). Add the note to the question's `sources`, and set it to Answered (4) per
+  SCHEMA.md. Do not rewrite an answer the user gave in full; add a "The meeting adds:" line only when the
+  evidence materially extends it.
+- **Verifier (fresh):** checks every drafted answer and every note point against the raw source, and
+  flags anything inferred rather than said.
+- **CHECKPOINT:** show the user a table (question ID, title, answer, source points, verifier concerns)
+  and the number of note points. Wait for their OK before touching requirements, unless they said to run
+  straight through.
+
+## Stage 4: change the requirements
+
+1. **Change list (one Opus agent):** from every answered question (this run's and the repo diff's) and
+   every note point, list the changes. Each change has: the item (or "new under <parent>"), the action
+   (edit, create, retire, move or status), what changes, and the sources. Every question and every point
+   either produces a change or is listed as "no requirement change", with the reason. Keep it as JSON in
+   the scratchpad.
+2. **Editors (one per epic touched, in parallel):** no two agents edit the same file. Each agent creates
+   new IDs only under its own epic. Moves between epics are done afterwards, one at a time. Each editor:
+   - reads `REQ/VOICE.md` first, its model story included;
+   - **rewrites** each affected item so it reads as current: the description says what the system now
+     does, for whom, and why; the acceptance criteria test it. Never add to an old description or
+     layer an "Update" paragraph over it (that is for question answers only);
+   - keeps the decision's trail out of the description: the note or question goes in `sources`, who
+     said what goes in Notes, and anything that is our reading rather than a decision is one line in
+     Notes ("Our readings (<document>): ...");
+   - leaves epics and features as a broad theme of what sits under them: no list of their stories, no
+     rules or detail (those go in the stories);
+   - adds the note or question to `sources` in date order, quoted only when it contains `#` or `: `
+     (`- "Notes 2026-10-01 · Client meeting #31"`, but `- OQ-73` bare: SCHEMA's quoting rule);
+   - writes each source in a form that resolves (Ground rules), so it opens its spot;
+   - moves status per the answering convention (Agreed (4) where settled, Verify (3) where it still needs
+     checking with whoever signs off, per "This repo"; never Confirmed (5) without the client's explicit sign-off);
+   - sets `components`;
+   - creates stories or features with the next free ID under the right parent;
+   - retires superseded items rather than deleting them;
+   - lists each relation on one side only.
+3. **Reviewer per epic (fresh, adversarial):**
+   - Does every edit match its source?
+   - Is anything invented?
+   - Is anything on the change list missing?
+   - Is the shape right per SCHEMA, and the wording per VOICE.md?
+   - Do the existing acceptance criteria still hold?
+   - Are there links to retired items?
+4. **Voice reviewer per epic (fresh, after the accuracy review):** one question per item: could a new
+   developer, or someone at the client, read this description without knowing any of the history?
+   It compares each edited item with VOICE.md's model story and fixes in place: history, names and
+   dates, decision numbers, provenance markers or update paragraphs in a description go to Notes; an
+   epic or feature that lists its stories or carries detail is cut back to its theme. It never changes
+   a requirement's meaning, an acceptance criterion's meaning, a status or a source. The check's
+   voice warnings (if `board.config.json` defines `voice.descriptionWarnings`) must be clear for every
+   edited item.
+5. **`domain-model.md`:** one agent plus a reviewer, if the model changed.
+6. **New questions:** add an OQ for each genuinely unresolved matter, with `affects` set to existing items.
+
+## Stage 5: finish
+
+1. Run the check ("This repo") until there are no errors, and no new warnings from this run.
+2. Links: run `npm --prefix BOARD run links:index`, then the `link-requirements` workflow, with
+   `batches` set to the touched epics (and `board` set to BOARD if it is not `requirements-board`).
+   Then run `npm --prefix BOARD run links:apply -- --dry-run`, check the output, and apply it without
+   `--dry-run`. Run the check again.
+3. **Completeness critic (fresh):** read the note and the change list against the final catalogue. Is
+   every point reflected or justified?
+4. **Change log:** write `REQ/changes/YYYY-MM-DD-<slug>.md`.
+   Create the folder if it is new, with a one-paragraph `README.md` explaining that it holds one change
+   log per requirements update, which any follow-on skill reads. Sections:
+   - Inputs (links to the note and the raw files);
+   - Questions answered;
+   - Items changed, added, retired or moved (ID link, title, what changed, sources);
+   - New questions;
+   - Points with no requirement change, and why.
+5. Report briefly: questions answered, items changed, added and retired, new questions, and anything
+   left for the user to decide. Remind them to commit and push, then, if "This repo" names a
+   follow-on skill, to run it with the commit (`/<skill> <commit>`).
